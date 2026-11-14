@@ -1,0 +1,26 @@
+[package]
+name = "cargo-black"
+version = "0.1.0"
+edition = "2024"
+description = "Keeps a Rust project on the black standards: layout, lints, editor settings."
+license = "MIT"
+repository = "https://github.com/Brendan-Black/black-rust"
+
+[dependencies]
+serde_json = "1.0.154"
+toml_edit = "0.25.19"
+
+[package.metadata.black]
+version = "0.1.0"
+
+# black-rust: compiler and Clippy lints. Owned by cargo black; edit it in black-rust, not here.
+# Everything else is rustc's and Clippy's defaults, which `cargo black check` runs with -D warnings.
+[lints.rust]
+# black errors/dont-swallow (correctness): an ignored Result is a swallowed error. forbid, so no #[allow] lifts it.
+unused_must_use = "forbid"
+
+[lints.clippy]
+# black errors/dont-swallow: `let _ = result;` discards an error on purpose; handle it, or say why with #[expect].
+let_underscore_must_use = "warn"
+# black errors/messages-for-debuggers: expect("why this can't fail") says what broke; unwrap() doesn't. Tests may unwrap.
+unwrap_used = "warn"
