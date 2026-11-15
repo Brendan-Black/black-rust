@@ -28,13 +28,13 @@ not yours. `#[rustfmt::skip]` on an item is the only way to keep a layout by han
 ## `cargo black`
 
 ```sh
-cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.1.0   # or: --path ~/github/rust/black-rust
+cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.2.0   # or: --path ~/github/rust/black-rust
 ```
 
 | Command | What it does |
 |---|---|
 | `cargo black sync` | Writes `rustfmt.toml`, `clippy.toml` and `.editorconfig`, and puts the lints in `Cargo.toml` (`[workspace.lints]` in a workspace, with `lints.workspace = true` in each package). Creates `.vscode/settings.json` if there is none, or lists what to change in an existing one. |
-| `cargo black check` | Fails if any of those files differ from the standards, if `cargo fmt` would change anything, or if `cargo clippy --all-targets` warns. For CI and before a commit. |
+| `cargo black check` | Fails if any of those files differ from the standards, if `cargo fmt` would change anything, if `cargo clippy --all-targets` warns, or if a package has a [magic string](#magic-strings). For CI and before a commit. |
 
 The standards are compiled into `cargo black`, and `sync` records its version in `Cargo.toml`
 (`[package.metadata.black]` or `[workspace.metadata.black]`). `check` refuses to run with a different version, so a
@@ -46,3 +46,48 @@ table, so a project's own lint settings there are replaced. To relax a lint in o
 
 `sync` puts the lints and the version at the end of `Cargo.toml`, wherever they were before, so its output is the
 same however often it runs; that's what `check` compares against.
+
+## Magic strings
+
+`check` reports every string value that appears in two literals of a package's non-test code, and every place it
+appears, by the definition in the guide's
+[name magic strings](https://github.com/Brendan-Black/black/blob/master/values/magic-strings.md#what-the-build-checks).
+Name it, with a `const` or an enum, and the literal appears once. Each package is checked on its own.
+
+Only identical values match: `"orderId"` matches `"orderId"` and nothing else, not `"orderid"` or
+`"orderIdList"`. Escapes are resolved first, so `"\x41"` matches `"A"`, and `r"a"` matches `"a"`.
+
+| A repeated value… | Is |
+|---|---|
+| passed as an argument at least once: `get("id")`, `.args(["--all"])`, `vec!["a"]`, `info!(target: "x", ...)` | an error |
+| never an argument: `let`, `return`, `==`, match arms | not reported, unless `magic-strings-elsewhere` asks |
+| only ever in `const`s and `static`s | not reported |
+
+Rust specifics: a literal is an argument when it is passed straight to a call, or inside `&`, `( )`, `[ ]` or a tuple
+there; every literal in a macro call is an argument, except the message. Not counted: messages (the format string of
+`format!`, `print!`/`println!`/`eprintln!`, `write!`, `panic!`, `assert!` and its kin, `anyhow!`/`bail!`/`ensure!`
+and the `log`/`tracing` macros, and what is formatted into it; the arguments of `expect`, `expect_err`, `context`,
+`wrap_err`, `ok_or`, `Err`, and any function of a type whose name ends in `Error`, such as `Error::invalid` or
+`io::Error::other`); values with no letter; values with whitespace in them; attributes and `extern "C"`;
+files whose opening comment has a line starting `@generated`; and test code: `tests/`, `benches/`, `examples/`, and
+anything under `#[test]` or `#[cfg(test)]`.
+
+Labels aren't counted either: a literal passed straight to a parameter of the package's own functions that only reaches
+a message, like `check("JSON", token)` where `check` only puts it in an `Err`. A function matches a call by name and
+number of arguments (`Type::f` by its type too); a parameter that is used any other way, or passed to a function that
+isn't known to take a message, is a value.
+
+A package changes both levels in its `Cargo.toml`, and a workspace's root sets them in `[workspace.metadata.black]`
+for every package that doesn't set its own. `sync` keeps the keys when it rewrites the table.
+
+```toml
+[package.metadata.black]
+magic-strings = "warn"              # values passed as arguments: "deny" (default), "warn" or "allow"
+magic-strings-elsewhere = "warn"    # the most a value that is never an argument can be: "allow" (default), "warn" or "deny"
+magic-strings-whitespace = true     # also check values with whitespace in them (default false)
+```
+
+`magic-strings = "allow"` turns the check off for the package; `magic-strings-elsewhere = "warn"` or `"deny"` also
+reports values that are never an argument.
+Values with whitespace in them (a space, a tab, a newline) are skipped unless `magic-strings-whitespace = true`: keys,
+headers and flags have none, so such a value is almost always text for people.
