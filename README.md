@@ -28,7 +28,7 @@ not yours. `#[rustfmt::skip]` on an item is the only way to keep a layout by han
 ## `cargo black`
 
 ```sh
-cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.2.3   # or: --path ~/github/rust/black-rust
+cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.2.4   # or: --path ~/github/rust/black-rust
 ```
 
 | Command | What it does |
@@ -61,7 +61,7 @@ Only identical values match: `"orderId"` matches `"orderId"` and nothing else, n
 |---|---|
 | passed as an argument at least once: `get("id")`, `.args(["--all"])`, `vec!["a"]`, `info!(target: "x", ...)` | an error |
 | passed as an argument once, every other use in other files or in that same function, and no constant among them | a warning: most likely another concept that shares the spelling, such as one flag in two commands' parsers |
-| in a `const` or `static` and also written as a literal that is passed as an argument | an error, wherever the two are: the name exists, so use it |
+| in a `const` or `static` and also written as a literal passed as an argument where that constant can be named (it is `pub`, or the literal is in its module or one inside it) | an error: the name exists, so use it |
 | only ever in one function, with at most one of its literals an argument (`strip_prefix("--x=")` beside a `"--x=" =>` arm) | not reported: read together, changed together. Two arguments in one function (declaring a flag and looking it up) are still an error |
 | all within `magic-strings-proximity` of each other, with no constant among them: in one statement, by default (`_ if arg.starts_with("--author") => value("--author")`) | not reported: read together, however many are arguments |
 | never an argument, in three or more functions: the same `==` or match arm written again (`"true" \| "yes" \| "on"` in four parsers) | a warning |

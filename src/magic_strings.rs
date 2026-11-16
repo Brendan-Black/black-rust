@@ -231,6 +231,8 @@ pub struct Place {
 	module: Vec<String>,
 	/// The settings of that module.
 	settings: Resolved,
+	/// For a definition, whether code outside its module can name it.
+	public: bool,
 }
 
 /// A value to report: where it appears, at which level, and whether any of those is an argument.
@@ -291,6 +293,7 @@ fn findings_in(package_dir: &Path, parsed: &[(PathBuf, syn::File)], policy: &Pol
 			settings,
 			seen: &mut seen,
 			in_definition: false,
+			public_definition: false,
 			messages: &messages,
 			owner: None,
 			scope: 0,
@@ -324,8 +327,8 @@ fn finding(places: Vec<Place>) -> Option<Finding> {
 	let mut arguments = places.iter().filter(|p| p.kind == Kind::Argument);
 	let first = arguments.next();
 	let lone_argument = match (first, arguments.next()) {
-		// Never with a constant among them: the name exists, so the literal is wrong wherever it is.
-		(Some(argument), None) if !defined => places.iter().all(|p| p.scope == argument.scope || p.file != argument.file),
+		// Never with a constant the argument could name: the name exists, so the literal is wrong.
+		(Some(argument), None) if !usable_constant(&places) => places.iter().all(|p| p.scope == argument.scope || p.file != argument.file),
 		_ => false,
 	};
 	let as_argument = first.is_some();
@@ -345,6 +348,19 @@ fn finding(places: Vec<Place>) -> Option<Finding> {
 		}
 	};
 	(level != Level::Allow).then_some(Finding { places, level, as_argument })
+}
+
+/// Whether a constant among these literals can be named where one of them is passed as an argument: it is `pub`, or the
+/// argument is in its module or a module inside it. A private constant of another module is no name the literal could
+/// use, so it says nothing about whether the two are one concept.
+fn usable_constant(places: &[Place]) -> bool {
+	let arguments: Vec<&Place> = places.iter().filter(|p| p.kind == Kind::Argument).collect();
+	places.iter().filter(|d| d.kind == Kind::Definition).any(|d| d.public || arguments.iter().any(|a| a.module.starts_with(&d.module)))
+}
+
+/// Whether an item can be named outside its module.
+fn is_public(vis: &syn::Visibility) -> bool {
+	!matches!(vis, syn::Visibility::Inherited)
 }
 
 /// How many functions a value never passed as an argument must be in to be the same check written again.
@@ -534,6 +550,8 @@ struct Finder<'a> {
 	seen: &'a mut BTreeMap<String, Vec<Place>>,
 	/// Inside a `const` or `static`, where every literal is a definition.
 	in_definition: bool,
+	/// Whether that constant can be named outside its module (`pub`, `pub(crate)` and the like).
+	public_definition: bool,
 	/// Which parameters of the package's functions are messages.
 	messages: &'a MessageParams,
 	/// The type of the `impl` being visited, which `Self` stands for.
@@ -580,6 +598,7 @@ impl Finder<'_> {
 			unit: self.unit,
 			module: self.module.clone(),
 			settings: self.settings,
+			public: self.in_definition && self.public_definition,
 		};
 		self.seen.entry(value).or_default().push(place);
 	}
@@ -598,11 +617,12 @@ impl Finder<'_> {
 		}
 	}
 
-	fn in_definition(&mut self, visit: impl FnOnce(&mut Self)) {
-		let outer = self.in_definition;
-		self.in_definition = true;
+	/// Visit a constant or static, `public` if code outside its module can name it.
+	fn in_definition(&mut self, public: bool, visit: impl FnOnce(&mut Self)) {
+		let outer = (self.in_definition, self.public_definition);
+		(self.in_definition, self.public_definition) = (true, public);
 		visit(self);
-		self.in_definition = outer;
+		(self.in_definition, self.public_definition) = outer;
 	}
 
 	/// Every string literal among a macro's tokens, as `kind`.
@@ -761,19 +781,19 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 	fn visit_abi(&mut self, _: &'ast syn::Abi) {}
 
 	fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
-		self.in_definition(|f| visit::visit_item_const(f, item));
+		self.in_definition(is_public(&item.vis), |f| visit::visit_item_const(f, item));
 	}
 
 	fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
-		self.in_definition(|f| visit::visit_item_static(f, item));
+		self.in_definition(is_public(&item.vis), |f| visit::visit_item_static(f, item));
 	}
 
 	fn visit_impl_item_const(&mut self, item: &'ast syn::ImplItemConst) {
-		self.in_definition(|f| visit::visit_impl_item_const(f, item));
+		self.in_definition(is_public(&item.vis), |f| visit::visit_impl_item_const(f, item));
 	}
 
 	fn visit_trait_item_const(&mut self, item: &'ast syn::TraitItemConst) {
-		self.in_definition(|f| visit::visit_trait_item_const(f, item));
+		self.in_definition(true, |f| visit::visit_trait_item_const(f, item));
 	}
 
 	fn visit_item(&mut self, item: &'ast syn::Item) {
@@ -1046,6 +1066,12 @@ mod tests {
 		// One argument, its only other use in another file: a warning, but not when that use is the constant.
 		let files = [("src/refs.rs", "pub const HEAD: &str = \"HEAD\";"), ("src/log.rs", "fn a() { resolve(\"HEAD\"); }")];
 		assert_eq!(check(&files)["HEAD"].level, Level::Deny);
+		// A private constant of another module is no name the literal could use: just a lone argument.
+		let private = [("src/speech.rs", "const ESPEAK_WAV: &str = \"-w\";"), ("src/awake.rs", "fn a() { run(\"-w\"); }")];
+		assert_eq!(check(&private)["-w"].level, Level::Warn);
+		// In its own module, or one inside it, it is.
+		let inside = [("src/speech.rs", "const WAV: &str = \"-w\";"), ("src/speech/espeak.rs", "fn a() { run(\"-w\"); }")];
+		assert_eq!(check(&inside)["-w"].level, Level::Deny);
 	}
 
 	#[test]
