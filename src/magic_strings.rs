@@ -37,15 +37,15 @@ mod message_params;
 use message_params::MessageParams;
 
 /// How severe a finding is, least severe first.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Level {
 	Allow,
 	Warn,
 	Deny,
 }
 
-/// The level for values passed as arguments: `[package.metadata.black]`, or `[workspace.metadata.black]` for every
-/// package that doesn't say. Deny by default.
+/// The level for values passed as arguments: `[package.metadata.black]`, `[workspace.metadata.black]` for every
+/// package that doesn't say, or a module's table (see [`MODULES_TABLE`]). Deny by default.
 pub const SETTING: &str = "magic-strings";
 /// The most severe a value that is never an argument can be, set the same way. Allow by default: only a value passed as
 /// an argument is reported unless a package opts in.
@@ -53,47 +53,58 @@ pub const ELSEWHERE_SETTING: &str = "magic-strings-elsewhere";
 /// Whether values with whitespace in them are checked, set the same way: `true` or `false`. False by default: a key, a
 /// header or a flag has none, so a value with a space or a newline is almost always text for people.
 pub const WHITESPACE_SETTING: &str = "magic-strings-whitespace";
-/// How close a value's literals must all be to be read together, and so not reported, set the same way: a number of
-/// lines (0, the default, is one line), or -1 for one file, -2 for one directory (a module and its submodules), -3 for
-/// the whole package.
+/// How close a value's literals must all be to be read together, and so not reported, set the same way: one of the
+/// [`Proximity`] words. `"statement"` by default.
 pub const PROXIMITY_SETTING: &str = "magic-strings-proximity";
+/// The table, under `[package.metadata.black]`, of settings for part of the package, keyed by module path:
+/// `[package.metadata.black.modules."cli::log"]`. A module's table covers it and the modules inside it.
+pub const MODULES_TABLE: &str = "modules";
 
-/// How close a value's literals must all be to be read together. A constant among them is never close: a constant plus
-/// a literal should use the constant.
-#[derive(Clone, Copy)]
+/// How close a value's literals must all be to be read together, narrowest first. A constant among them is never close:
+/// a constant plus a literal should use the constant.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Proximity {
-	/// Within this many lines of each other, in one file: 0 is one line.
-	Lines(usize),
+	/// One statement, or one branch: a match arm with its guard, or an `if`'s condition with its block. Where the
+	/// formatter breaks the lines doesn't matter.
+	Statement,
+	/// One function (or other item).
+	Function,
 	File,
-	/// One directory: a module and its submodules.
-	Directory,
-	/// The whole package, so no value is reported.
-	Package,
+	/// One module below the crate root and the modules inside it (`cli` and `cli::log`), or the root module's own code.
+	Module,
+	/// The whole crate: no value is reported.
+	Crate,
 }
 
+/// Each proximity by the word a manifest uses for it.
+const PROXIMITIES: [(&str, Proximity); 5] = [
+	("statement", Proximity::Statement),
+	("function", Proximity::Function),
+	("file", Proximity::File),
+	("module", Proximity::Module),
+	("crate", Proximity::Crate),
+];
+
 impl Proximity {
-	pub fn parse(n: i64) -> Result<Self, String> {
-		match n {
-			-1 => Ok(Self::File),
-			-2 => Ok(Self::Directory),
-			-3 => Ok(Self::Package),
-			_ => usize::try_from(n).map(Self::Lines).map_err(|_| format!("{PROXIMITY_SETTING} is {n}; expected a number of lines (0 or more), -1, -2 or -3")),
-		}
+	pub fn parse(value: &str) -> Result<Self, String> {
+		PROXIMITIES.iter().find(|(word, _)| *word == value).map(|(_, p)| *p).ok_or_else(|| {
+			let words: Vec<String> = PROXIMITIES.iter().map(|(word, _)| format!("\"{word}\"")).collect();
+			format!("{PROXIMITY_SETTING} is \"{value}\"; expected one of {}", words.join(", "))
+		})
 	}
 
 	/// Whether these literals are all this close.
 	fn holds(self, places: &[Place]) -> bool {
 		let Some(first) = places.first() else { return false };
-		let same_file = places.iter().all(|p| p.file == first.file);
 		match self {
-			Self::Lines(n) => {
-				let low = places.iter().map(|p| p.line).min().unwrap_or(first.line);
-				let high = places.iter().map(|p| p.line).max().unwrap_or(first.line);
-				same_file && high - low <= n
-			}
-			Self::File => same_file,
-			Self::Directory => places.iter().all(|p| p.file.parent() == first.file.parent()),
-			Self::Package => true,
+			Self::Statement => places.iter().all(|p| p.unit == first.unit),
+			Self::Function => places.iter().all(|p| p.scope == first.scope),
+			Self::File => places.iter().all(|p| p.file == first.file),
+			Self::Module => match first.module.first() {
+				Some(top) => places.iter().all(|p| p.module.first() == Some(top)),
+				None => places.iter().all(|p| p.module.is_empty()),
+			},
+			Self::Crate => true,
 		}
 	}
 }
@@ -111,34 +122,138 @@ impl Level {
 	}
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Settings as one table gives them: each may be left to the table above (a module's to its parent module's, then the
+/// package's, then the workspace's).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Settings {
+	pub level: Option<Level>,
+	pub elsewhere: Option<Level>,
+	pub whitespace: Option<bool>,
+	pub proximity: Option<Proximity>,
+}
+
+impl Settings {
+	/// These, with what they leave unset taken from `outer`.
+	pub fn or(self, outer: Self) -> Self {
+		Self {
+			level: self.level.or(outer.level),
+			elsewhere: self.elsewhere.or(outer.elsewhere),
+			whitespace: self.whitespace.or(outer.whitespace),
+			proximity: self.proximity.or(outer.proximity),
+		}
+	}
+}
+
+/// The settings a literal is checked by, everything decided.
+#[derive(Clone, Copy, Debug)]
+struct Resolved {
+	level: Level,
+	/// Already capped at `level`.
+	elsewhere: Level,
+	whitespace: bool,
+	proximity: Proximity,
+}
+
+/// The package's settings, and its modules'.
+pub struct Policy {
+	package: Settings,
+	/// Module path and its table, shortest path first, so a longer one is applied after (over) a shorter.
+	modules: Vec<(Vec<String>, Settings)>,
+}
+
+impl Policy {
+	/// `package` is the package's settings over the workspace's; `modules` maps a module path (`"cli::log"`, with or
+	/// without `crate::`) to its table.
+	pub fn new(package: Settings, modules: Vec<(String, Settings)>) -> Self {
+		let mut modules: Vec<(Vec<String>, Settings)> = modules.into_iter().map(|(path, settings)| (module_path_of(&path), settings)).collect();
+		modules.sort_by_key(|(path, _)| path.len());
+		Self { package, modules }
+	}
+
+	/// The settings for a module: its longest matching table's, then shorter ones', then the package's, then the defaults.
+	fn resolve(&self, module: &[String]) -> Resolved {
+		let mut settings = self.package;
+		for (path, table) in &self.modules {
+			if module.starts_with(path) {
+				settings = table.or(settings);
+			}
+		}
+		let level = settings.level.unwrap_or(Level::Deny);
+		Resolved {
+			level,
+			elsewhere: settings.elsewhere.unwrap_or(Level::Allow).min(level),
+			whitespace: settings.whitespace.unwrap_or(false),
+			proximity: settings.proximity.unwrap_or(Proximity::Statement),
+		}
+	}
+}
+
+/// `"crate::cli::log"` or `"cli::log"` as the module path `["cli", "log"]`.
+fn module_path_of(path: &str) -> Vec<String> {
+	path.split("::").filter(|part| !part.is_empty() && *part != "crate").map(str::to_owned).collect()
+}
+
+/// A file's module path, from where it is in the package: `src/cli/log.rs` and `src/cli/log/mod.rs` are `cli::log`;
+/// `src/lib.rs`, `src/main.rs`, a binary in `src/bin/` and `build.rs` are the crate root.
+fn module_of(package_dir: &Path, file: &Path) -> Vec<String> {
+	let relative = file.strip_prefix(package_dir).unwrap_or(file);
+	let mut parts: Vec<String> = relative.with_extension("").components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+	if parts.first().is_some_and(|p| p == "src") {
+		parts.remove(0);
+	}
+	if parts.first().is_some_and(|p| p == BIN_DIR) || parts.as_slice() == ["lib"] || parts.as_slice() == ["main"] || parts.as_slice() == ["build"] {
+		return Vec::new();
+	}
+	if parts.last().is_some_and(|p| p == "mod") {
+		parts.pop();
+	}
+	parts
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
 	Argument,
 	Definition,
 	Elsewhere,
 }
 
-/// Where a literal is: its file, its 1-based line and column, its kind, and the function (or other item) it is in.
+/// Where a literal is: its file, its 1-based line and column, its kind, and what it is in.
 pub struct Place {
 	pub file: PathBuf,
 	pub line: usize,
 	pub column: usize,
 	pub kind: Kind,
 	/// The function, or other item outside one, the literal is in: unique across the package.
-	pub scope: usize,
+	scope: usize,
+	/// The statement or branch the literal is in: unique across the package.
+	unit: usize,
+	/// The module the file is.
+	module: Vec<String>,
+	/// The settings of that module.
+	settings: Resolved,
 }
 
-/// A value to report: where it appears, whether any of those is an argument, and whether that argument is alone.
+/// A value to report: where it appears, at which level, and whether any of those is an argument.
 pub struct Finding {
 	pub places: Vec<Place>,
+	pub level: Level,
 	pub as_argument: bool,
-	/// One argument, every other use being outside its file (or in its own function): most likely another concept
-	/// that shares the spelling, such as one flag in two commands' parsers, so it is reported at most as a warning.
-	pub lone_argument: bool,
+}
+
+impl Finding {
+	/// The places that make the value this level, and the rest. For a value passed as an argument: the arguments, and
+	/// the other uses in their files. Otherwise all of them.
+	pub fn triggering(&self) -> (Vec<&Place>, Vec<&Place>) {
+		if !self.as_argument {
+			return (self.places.iter().collect(), Vec::new());
+		}
+		let files: Vec<&Path> = self.places.iter().filter(|p| p.kind == Kind::Argument).map(|p| p.file.as_path()).collect();
+		self.places.iter().partition(|p| files.contains(&p.file.as_path()))
+	}
 }
 
 /// Every value to report in the package's non-test code, sorted by value.
-pub fn findings(package_dir: &Path, whitespace: bool, proximity: Proximity) -> Result<BTreeMap<String, Finding>, String> {
+pub fn findings(package_dir: &Path, policy: &Policy) -> Result<BTreeMap<String, Finding>, String> {
 	let mut files = Vec::new();
 	collect_files(package_dir, true, &mut files)?;
 	files.sort();
@@ -155,32 +270,51 @@ pub fn findings(package_dir: &Path, whitespace: bool, proximity: Proximity) -> R
 		parsed.push((file, syntax));
 	}
 	parsed.retain(|(file, _)| !test_modules.iter().any(|m| file.starts_with(m)));
-	Ok(findings_in(&parsed, whitespace, proximity))
+	Ok(findings_in(package_dir, &parsed, policy))
 }
 
 /// Every value to report in these parsed files, sorted by value.
-fn findings_in(parsed: &[(PathBuf, syn::File)], whitespace: bool, proximity: Proximity) -> BTreeMap<String, Finding> {
+fn findings_in(package_dir: &Path, parsed: &[(PathBuf, syn::File)], policy: &Policy) -> BTreeMap<String, Finding> {
 	let messages = MessageParams::of(&parsed.iter().map(|(_, syntax)| syntax).collect::<Vec<_>>());
 	let mut seen: BTreeMap<String, Vec<Place>> = BTreeMap::new();
-	let mut scopes = 0;
+	let mut counters = Counters::default();
 	for (file, syntax) in parsed {
-		let mut finder = Finder { file, seen: &mut seen, in_definition: false, whitespace, messages: &messages, owner: None, scope: 0, scopes: &mut scopes };
-		finder.new_scope();
-		finder.visit_file(syntax);
+		let module = module_of(package_dir, file);
+		let settings = policy.resolve(&module);
+		if settings.level == Level::Allow {
+			// Not checked, so not counted: like a Java package set to "ignore".
+			continue;
+		}
+		let mut finder = Finder {
+			file,
+			module,
+			settings,
+			seen: &mut seen,
+			in_definition: false,
+			messages: &messages,
+			owner: None,
+			scope: 0,
+			unit: 0,
+			join_next: false,
+			counters: &mut counters,
+		};
+		finder.in_scope(|f| f.visit_file(syntax));
 	}
-	seen.into_iter().filter_map(|(value, places)| finding(places, proximity).map(|f| (value, f))).collect()
+	seen.into_iter().filter_map(|(value, places)| finding(places).map(|f| (value, f))).collect()
 }
 
 /// What to report of a value's literals, if anything: not a value seen once, nor one whose literals are all definitions,
-/// nor one whose literals are all in one function (or other item) with at most one of them an argument, where they are
-/// read together and change together.
-fn finding(places: Vec<Place>, proximity: Proximity) -> Option<Finding> {
+/// nor one whose literals are all in one function (or other item) with at most one of them an argument, nor one whose
+/// literals are all close enough to be read together. A value across modules takes the most severe of their levels and
+/// the narrowest of their proximities.
+fn finding(places: Vec<Place>) -> Option<Finding> {
 	// One function's literals are exempt only with at most one argument among them: two (declaring a flag and looking it
 	// up, or writing a key and reading it) are the typo the rule is for.
 	let arguments_in_all = places.iter().filter(|p| p.kind == Kind::Argument).count();
 	let one_scope = places.iter().all(|p| p.scope == places[0].scope) && arguments_in_all <= 1;
-	// Literals this close, however many are arguments, are read together: `starts_with("--x")` and `value("--x")` on one
-	// parser line. Not with a constant among them, though: a constant plus a literal should use the constant.
+	let proximity = places.iter().map(|p| p.settings.proximity).min()?;
+	// Literals this close, however many are arguments, are read together: `starts_with("--x")` and `value("--x")` in one
+	// match arm. Not with a constant among them, though: a constant plus a literal should use the constant.
 	let close = places.iter().all(|p| p.kind != Kind::Definition) && proximity.holds(&places);
 	if places.len() < 2 || places.iter().all(|p| p.kind == Kind::Definition) || one_scope || close {
 		return None;
@@ -192,7 +326,21 @@ fn finding(places: Vec<Place>, proximity: Proximity) -> Option<Finding> {
 		_ => false,
 	};
 	let as_argument = first.is_some();
-	Some(Finding { places, as_argument, lone_argument })
+	let as_argument_level = places.iter().map(|p| p.settings.level).max()?;
+	let level = match (as_argument, lone_argument) {
+		// A lone argument, likely another concept sharing the spelling, is at most a warning.
+		(true, true) => as_argument_level.min(Level::Warn),
+		(true, false) => as_argument_level,
+		(false, _) => places.iter().map(|p| p.settings.elsewhere).max()?,
+	};
+	(level != Level::Allow).then_some(Finding { places, level, as_argument })
+}
+
+/// Number sources, so each scope and unit gets its own number across the package.
+#[derive(Default)]
+struct Counters {
+	scopes: usize,
+	units: usize,
 }
 
 /// Files that are modules' roots, so their `mod x;` is a sibling `x.rs` rather than one in a directory named after them.
@@ -275,6 +423,45 @@ fn collect_files(dir: &Path, is_root: bool, out: &mut Vec<PathBuf>) -> Result<()
 
 /// Methods whose string arguments are messages for people.
 const MESSAGE_METHODS: [&str; 5] = ["expect", "expect_err", "context", "wrap_err", "ok_or"];
+/// `Formatter`'s builders of `Debug` output, which black's debug-strings rule treats as text for people: the name they
+/// take, and the field names and entries added to them (`f.debug_struct("Myers").field("minimal", &self.minimal)`).
+const DEBUG_BUILDERS: [&str; 5] = ["debug_struct", "debug_tuple", "debug_map", "debug_set", "debug_list"];
+/// What the `Debug` builders add: a field's name, a map's key or value, an entry.
+const DEBUG_PARTS: [&str; 5] = ["field", "entry", "entries", "key", "value"];
+
+/// Whether a call is a `Debug` builder, or adds to one: its string arguments are labels in debug output.
+fn is_debug_output(call: &syn::ExprMethodCall) -> bool {
+	let method = call.method.to_string();
+	if DEBUG_BUILDERS.contains(&method.as_str()) {
+		return true;
+	}
+	if !DEBUG_PARTS.contains(&method.as_str()) {
+		return false;
+	}
+	// Only on a chain that starts at a builder: `MapBuilder::new().field("type", ..)` builds a value.
+	let mut receiver = &*call.receiver;
+	while let syn::Expr::MethodCall(inner) = receiver {
+		if DEBUG_BUILDERS.contains(&inner.method.to_string().as_str()) {
+			return true;
+		}
+		receiver = &inner.receiver;
+	}
+	false
+}
+
+/// Whether a value has a letter in it, not counting the one after a backslash: `"\\t"` is an escape, spelled out.
+fn has_letter(value: &str) -> bool {
+	let mut chars = value.chars();
+	while let Some(c) = chars.next() {
+		if c == '\\' {
+			chars.next();
+		} else if c.is_alphabetic() {
+			return true;
+		}
+	}
+	false
+}
+
 /// Functions, by the last part of their path, whose string arguments are messages for people.
 const MESSAGE_FUNCTIONS: [&str; 1] = ["Err"];
 /// The end of a type's name that says its functions build errors (`Error::invalid`, `io::Error::other`), whose string
@@ -327,42 +514,60 @@ fn message_of(macro_name: &str) -> Option<Message> {
 
 struct Finder<'a> {
 	file: &'a Path,
+	/// The module the file is, and its settings.
+	module: Vec<String>,
+	settings: Resolved,
 	seen: &'a mut BTreeMap<String, Vec<Place>>,
 	/// Inside a `const` or `static`, where every literal is a definition.
 	in_definition: bool,
-	/// Whether values with whitespace in them are counted.
-	whitespace: bool,
 	/// Which parameters of the package's functions are messages.
 	messages: &'a MessageParams,
 	/// The type of the `impl` being visited, which `Self` stands for.
 	owner: Option<String>,
 	/// The function (or other item) being visited.
 	scope: usize,
-	/// How many scopes the package has had, so each gets its own number.
-	scopes: &'a mut usize,
+	/// The statement or branch being visited.
+	unit: usize,
+	/// Just past a branch's head (a match arm's pattern and guard, an `if`'s condition): the next statement, the first of
+	/// its body, is in the head's unit; every later one is a unit of its own.
+	join_next: bool,
+	counters: &'a mut Counters,
 }
 
 impl Finder<'_> {
-	/// Enter a scope of its own, returning the one it was in.
-	fn new_scope(&mut self) -> usize {
-		*self.scopes += 1;
-		std::mem::replace(&mut self.scope, *self.scopes)
-	}
-
-	/// Visit an item in a scope of its own.
+	/// Visit an item in a scope, and a unit, of its own.
 	fn in_scope(&mut self, visit: impl FnOnce(&mut Self)) {
-		let outer = self.new_scope();
-		visit(self);
+		self.counters.scopes += 1;
+		let outer = std::mem::replace(&mut self.scope, self.counters.scopes);
+		self.in_unit(false, visit);
 		self.scope = outer;
 	}
 
+	/// Visit a statement, or a branch, in a unit of its own. A branch (`join` true) shares it with its body's first statement.
+	fn in_unit(&mut self, join: bool, visit: impl FnOnce(&mut Self)) {
+		self.counters.units += 1;
+		let outer = (std::mem::replace(&mut self.unit, self.counters.units), std::mem::replace(&mut self.join_next, join));
+		visit(self);
+		(self.unit, self.join_next) = outer;
+	}
+
 	fn record(&mut self, value: String, span: proc_macro2::Span, kind: Kind) {
-		if !value.chars().any(char::is_alphabetic) || (!self.whitespace && value.chars().any(char::is_whitespace)) {
+		if !has_letter(&value) || (!self.settings.whitespace && value.chars().any(char::is_whitespace)) {
 			return;
 		}
 		let kind = if self.in_definition { Kind::Definition } else { kind };
 		let start = span.start();
-		self.seen.entry(value).or_default().push(Place { file: self.file.to_owned(), line: start.line, column: start.column + 1, kind, scope: self.scope });
+		let place = Place {
+			file: self.file.to_owned(),
+			line: start.line,
+			column: start.column + 1,
+			kind,
+			scope: self.scope,
+			unit: self.unit,
+			module: self.module.clone(),
+			settings: self.settings,
+		};
+		self.seen.entry(value).or_default().push(place);
 	}
 
 	/// An expression passed to a call: a string literal in it is an argument, also inside `&`, `( )`, `[ ]` and tuples.
@@ -476,7 +681,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 
 	fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
 		self.visit_expr(&call.receiver);
-		if MESSAGE_METHODS.contains(&call.method.to_string().as_str()) {
+		if MESSAGE_METHODS.contains(&call.method.to_string().as_str()) || is_debug_output(call) {
 			return;
 		}
 		for (i, arg) in call.args.iter().enumerate() {
@@ -506,6 +711,36 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 		};
 		visit::visit_item_impl(self, item);
 		self.owner = outer;
+	}
+
+	// Statements and branches, for the "statement" proximity. A branch's head (a match arm's pattern and guard, an `if`'s
+	// condition) is one unit with what it leads to: an arm's expression, or the first statement of its block. So
+	// `_ if a.starts_with("--x") => value("--x")` is one however the formatter breaks its lines, but two statements in
+	// one arm (declaring a flag, then looking it up) are two.
+	fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+		if std::mem::take(&mut self.join_next) {
+			visit::visit_stmt(self, stmt);
+		} else {
+			self.in_unit(false, |f| visit::visit_stmt(f, stmt));
+		}
+	}
+
+	fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+		self.in_unit(true, |f| visit::visit_arm(f, arm));
+	}
+
+	fn visit_expr_if(&mut self, e: &'ast syn::ExprIf) {
+		self.in_unit(true, |f| {
+			f.visit_expr(&e.cond);
+			f.visit_block(&e.then_branch);
+		});
+		if let Some((_, otherwise)) = &e.else_branch {
+			match &**otherwise {
+				// `else if` is a branch of its own.
+				syn::Expr::If(_) => self.visit_expr(otherwise),
+				block => self.in_unit(true, |f| f.visit_expr(block)),
+			}
+		}
 	}
 
 	/// `extern "C"` names an ABI, not a value.
@@ -599,98 +834,162 @@ fn mentions_test(tokens: proc_macro2::TokenStream) -> bool {
 mod tests {
 	use super::*;
 
-	/// The findings in these files, each given as its path and source.
-	fn check(files: &[(&str, &str)]) -> BTreeMap<String, Finding> {
+	/// The findings in these files, each given as its path in the package and its source, by these settings.
+	fn check_with(files: &[(&str, &str)], package: Settings, modules: Vec<(&str, Settings)>) -> BTreeMap<String, Finding> {
 		let parsed: Vec<(PathBuf, syn::File)> = files.iter().map(|(path, text)| (PathBuf::from(path), syn::parse_file(text).unwrap())).collect();
-		findings_in(&parsed, false, Proximity::Lines(0))
+		let policy = Policy::new(package, modules.into_iter().map(|(path, s)| (path.to_owned(), s)).collect());
+		findings_in(Path::new(""), &parsed, &policy)
+	}
+
+	/// The findings in these files, by the default settings.
+	fn check(files: &[(&str, &str)]) -> BTreeMap<String, Finding> {
+		check_with(files, Settings::default(), Vec::new())
+	}
+
+	fn at(proximity: Proximity) -> Settings {
+		Settings { proximity: Some(proximity), ..Settings::default() }
 	}
 
 	#[test]
 	fn a_value_passed_from_two_functions_is_reported() {
-		let found = check(&[("a.rs", "fn put() { set(\"allow-ff\"); }\nfn get() { read(\"allow-ff\"); }")]);
-		assert!(found["allow-ff"].as_argument && !found["allow-ff"].lone_argument);
+		let found = check(&[("src/a.rs", "fn put() { set(\"allow-ff\"); }\nfn get() { read(\"allow-ff\"); }")]);
+		assert!(found["allow-ff"].as_argument && found["allow-ff"].level == Level::Deny);
 	}
 
 	#[test]
 	fn literals_in_one_function_are_not() {
-		let found = check(&[("a.rs", "fn parse(a: &str) { if let Some(v) = a.strip_prefix(\"--abbrev=\") {} match a { \"--abbrev=\" => {}, _ => {} } }")]);
+		let found = check(&[("src/a.rs", "fn parse(a: &str) { if let Some(v) = a.strip_prefix(\"--abbrev=\") {} match a { \"--abbrev=\" => {}, _ => {} } }")]);
 		assert!(found.is_empty());
 	}
 
 	#[test]
 	fn two_arguments_in_one_function_are_reported() {
-		let found = check(&[("a.rs", "fn run(rest: &[&str]) {\nlet a = parse(rest, &[(\"allow-http\", 0)]);\nif a.has(\"allow-http\") {}\n}")]);
-		assert!(found["allow-http"].as_argument && !found["allow-http"].lone_argument);
-	}
-
-	/// The findings in one file at a proximity.
-	fn check_at(text: &str, proximity: Proximity) -> BTreeMap<String, Finding> {
-		findings_in(&[(PathBuf::from("a.rs"), syn::parse_file(text).unwrap())], false, proximity)
+		let found = check(&[("src/a.rs", "fn run(rest: &[&str]) {\nlet a = parse(rest, &[(\"allow-http\", 0)]);\nif a.has(\"allow-http\") {}\n}")]);
+		assert_eq!(found["allow-http"].level, Level::Deny);
 	}
 
 	#[test]
-	fn arguments_on_one_line_are_read_together() {
-		let found = check(&[("a.rs", "fn parse(arg: &str) { if arg.starts_with(\"--author\") { value(\"--author\"); } }")]);
-		assert!(found.is_empty());
+	fn one_statement_is_read_together_however_it_is_wrapped() {
+		// A match arm and its guard, broken over lines the way rustfmt does.
+		let arm = "fn parse(arg: &str) { match arg {\n_ if arg.starts_with(\"--date\") =>\n{ value(\"--date\"); }\n_ => {} } }";
+		assert!(check(&[("src/a.rs", arm)]).is_empty());
+		// An `if`'s condition and its block.
+		let branch = "fn parse(arg: &str) {\nif arg.starts_with(\"--author\") {\nvalue(\"--author\");\n}\n}";
+		assert!(check(&[("src/a.rs", branch)]).is_empty());
+		// Two statements are two.
+		let two = "fn run() {\nlet a = parse(&[(\"allow-http\", 0)]);\nlet b = a.has(\"allow-http\");\n}";
+		assert!(check(&[("src/a.rs", two)]).contains_key("allow-http"));
+		// Two statements in one arm are two as well: declaring a flag, then looking it up.
+		let arm_of_two = "fn run(cmd: &str) { match cmd { \"log\" => {\nlet a = parse(&[(\"oldest\", 0)]);\nquery(!a.has(\"oldest\"));\n} _ => {} } }";
+		assert!(check(&[("src/a.rs", arm_of_two)]).contains_key("oldest"));
 	}
 
 	#[test]
 	fn proximity_widens_what_is_read_together() {
-		let text = "fn put() {\nset(\"allow-ff\");\n}\nfn get() {\nread(\"allow-ff\");\n}";
-		assert!(check_at(text, Proximity::Lines(0)).contains_key("allow-ff"));
-		assert!(check_at(text, Proximity::Lines(2)).contains_key("allow-ff"));
-		assert!(check_at(text, Proximity::Lines(3)).is_empty());
-		assert!(check_at(text, Proximity::File).is_empty());
-		let two_files = [("a/x.rs", "fn put() { set(\"allow-ff\"); }"), ("a/y.rs", "fn get() { read(\"allow-ff\"); }")];
-		let parsed: Vec<(PathBuf, syn::File)> = two_files.iter().map(|(p, t)| (PathBuf::from(p), syn::parse_file(t).unwrap())).collect();
-		assert!(findings_in(&parsed, false, Proximity::File).contains_key("allow-ff"));
-		assert!(findings_in(&parsed, false, Proximity::Directory).is_empty());
+		let two_functions = [("src/cli/a.rs", "fn put() { set(\"allow-ff\"); }\nfn get() { read(\"allow-ff\"); }")];
+		assert!(check_with(&two_functions, at(Proximity::Statement), Vec::new()).contains_key("allow-ff"));
+		assert!(check_with(&two_functions, at(Proximity::Function), Vec::new()).contains_key("allow-ff"));
+		assert!(check_with(&two_functions, at(Proximity::File), Vec::new()).is_empty());
+		let two_files = [("src/cli/a.rs", "fn put() { set(\"allow-ff\"); }"), ("src/cli/b.rs", "fn get() { read(\"allow-ff\"); }")];
+		assert!(check_with(&two_files, at(Proximity::File), Vec::new()).contains_key("allow-ff"));
+		assert!(check_with(&two_files, at(Proximity::Module), Vec::new()).is_empty());
+		let two_modules = [("src/cli.rs", "fn put() { set(\"allow-ff\"); }"), ("src/odb.rs", "fn get() { read(\"allow-ff\"); }")];
+		assert!(check_with(&two_modules, at(Proximity::Module), Vec::new()).contains_key("allow-ff"));
+		assert!(check_with(&two_modules, at(Proximity::Crate), Vec::new()).is_empty());
+		assert!(Proximity::parse("line").is_err() && Proximity::parse("module").is_ok());
 	}
 
 	#[test]
 	fn a_constant_is_never_close() {
-		let found = check(&[("a.rs", "const KEY: &str = \"allow-ff\"; fn a() { set(\"allow-ff\"); }")]);
+		let found = check_with(&[("src/a.rs", "const KEY: &str = \"allow-ff\"; fn a() { set(\"allow-ff\"); }")], at(Proximity::Crate), Vec::new());
 		assert!(found.contains_key("allow-ff"));
-		assert!(Proximity::parse(-4).is_err() && Proximity::parse(5).is_ok());
+	}
+
+	#[test]
+	fn a_module_table_covers_its_module_and_those_inside_it() {
+		let files =
+			[("src/cli/log.rs", "fn a() { set(\"-n\"); }\nfn b() { read(\"-n\"); }"), ("src/odb.rs", "fn c() { set(\"HEAD\"); }\nfn d() { read(\"HEAD\"); }")];
+		let warn = Settings { level: Some(Level::Warn), ..Settings::default() };
+		let found = check_with(&files, Settings::default(), vec![("cli", warn)]);
+		assert_eq!(found["-n"].level, Level::Warn);
+		assert_eq!(found["HEAD"].level, Level::Deny);
+		// The longer path wins, for what it sets; `crate::` is optional.
+		let deny = Settings { level: Some(Level::Deny), ..Settings::default() };
+		assert_eq!(check_with(&files, Settings::default(), vec![("cli", warn), ("crate::cli::log", deny)])["-n"].level, Level::Deny);
+		// "allow" leaves the module's literals out altogether.
+		let allow = Settings { level: Some(Level::Allow), ..Settings::default() };
+		assert!(!check_with(&files, Settings::default(), vec![("cli", allow)]).contains_key("-n"));
+		// A value across modules takes the most severe level.
+		let across = [("src/cli/log.rs", "fn a() { set(\"pack\"); }"), ("src/odb.rs", "fn c() { read(\"pack\"); }")];
+		assert_eq!(check_with(&across, Settings::default(), vec![("cli", warn)])["pack"].level, Level::Deny);
+	}
+
+	#[test]
+	fn the_report_leads_with_what_makes_it_an_error() {
+		let files =
+			[("src/cli/log.rs", "fn a() { set(\"-n\"); }\nfn b() { read(\"-n\"); }"), ("src/cli/clone.rs", "fn c(a: &str) { match a { \"-n\" => {}, _ => {} } }")];
+		let found = check(&files);
+		let (shown, rest) = found["-n"].triggering();
+		assert_eq!((shown.len(), rest.len()), (2, 1));
 	}
 
 	#[test]
 	fn arrays_passed_on_stay_arguments() {
-		let found = check(&[("a.rs", "fn a() { c.args([\"--all\"]); }\nfn b() { d.args(vec![\"--all\"]); }")]);
+		let found = check(&[("src/a.rs", "fn a() { c.args([\"--all\"]); }\nfn b() { d.args(vec![\"--all\"]); }")]);
 		assert!(found["--all"].as_argument);
 	}
 
 	#[test]
 	fn a_wrapped_value_returned_is_not_an_argument() {
-		let found = check(&[("a.rs", "fn name() -> Option<&'static str> { Some(\"hard\") }\nfn is(a: &str) -> bool { a == \"hard\" }")]);
+		let found = check_with(
+			&[("src/a.rs", "fn name() -> Option<&'static str> { Some(\"hard\") }\nfn is(a: &str) -> bool { a == \"hard\" }")],
+			Settings { elsewhere: Some(Level::Warn), ..Settings::default() },
+			Vec::new(),
+		);
 		assert!(!found["hard"].as_argument);
 		// Passed on, it still is.
-		let found = check(&[("a.rs", "fn one() { f(Some(\"hard\")); }\nfn two() { g(\"hard\"); }")]);
+		let found = check(&[("src/a.rs", "fn one() { f(Some(\"hard\")); }\nfn two() { g(\"hard\"); }")]);
 		assert!(found["hard"].as_argument);
 	}
 
 	#[test]
 	fn compile_time_macros_are_not_counted() {
-		let found = check(&[("a.rs", "fn a() { f(env!(\"CARGO_PKG_VERSION\")); }\nfn b() { g(env!(\"CARGO_PKG_VERSION\")); }")]);
+		let found = check(&[("src/a.rs", "fn a() { f(env!(\"CARGO_PKG_VERSION\")); }\nfn b() { g(env!(\"CARGO_PKG_VERSION\")); }")]);
 		assert!(found.is_empty());
 	}
 
 	#[test]
-	fn a_lone_argument_among_other_files_uses_is_marked() {
+	fn debug_output_is_not_counted() {
+		let debug = "fn fmt(&self, f: &mut Formatter) -> Result { f.debug_struct(\"Diff\").field(\"myers\", &self.myers).finish() }";
+		let found = check(&[("src/a.rs", debug), ("src/b.rs", "fn x() { set(\"myers\"); }")]);
+		assert!(found.is_empty());
+		// A builder of a value is not one: these are keys.
+		let found = check(&[("src/a.rs", "fn a() { MapBuilder::new().field(\"type\", 1); }\nfn b() { get(\"type\"); }")]);
+		assert!(found.contains_key("type"));
+	}
+
+	#[test]
+	fn an_escape_spelled_out_has_no_letter() {
+		let found = check(&[("src/a.rs", "fn a() { f(\"\\\\t\"); }\nfn b() { g(\"\\\\t\"); }")]);
+		assert!(found.is_empty());
+	}
+
+	#[test]
+	fn a_lone_argument_among_other_files_uses_is_a_warning() {
 		let found = check(&[
-			("a.rs", "fn quiet(a: &str) { f(\"-q\"); match a { \"-q\" => {}, _ => {} } }"),
-			("b.rs", "fn parse(a: &str) { match a { \"-q\" => {}, _ => {} } }"),
+			("src/a.rs", "fn quiet(a: &str) { f(\"-q\"); match a { \"-q\" => {}, _ => {} } }"),
+			("src/b.rs", "fn parse(a: &str) { match a { \"-q\" => {}, _ => {} } }"),
 		]);
-		assert!(found["-q"].lone_argument);
+		assert_eq!(found["-q"].level, Level::Warn);
 		// Another use in the argument's own file, outside its function, is the same concept as far as anyone can tell.
-		let found = check(&[("a.rs", "fn one() { f(\"-q\"); }\nfn two(a: &str) { match a { \"-q\" => {}, _ => {} } }")]);
-		assert!(!found["-q"].lone_argument);
+		let found = check(&[("src/a.rs", "fn one() { f(\"-q\"); }\nfn two(a: &str) { match a { \"-q\" => {}, _ => {} } }")]);
+		assert_eq!(found["-q"].level, Level::Deny);
 	}
 
 	#[test]
 	fn a_label_is_not_counted() {
 		let found = check(&[(
-			"a.rs",
+			"src/a.rs",
 			"fn check(fmt: &str) -> Result<(), Error> { Err(Error::invalid(format!(\"{fmt} is bad\"))) }\nfn a() { check(\"JSON\"); }\nfn b() { check(\"JSON\"); }",
 		)]);
 		assert!(found.is_empty());
@@ -698,16 +997,26 @@ mod tests {
 
 	#[test]
 	fn an_unused_parameter_is_not_a_message() {
-		let found = check(&[("a.rs", "fn set(_key: &str) {}\nfn a() { set(\"allow-ff\"); }\nfn b() { set(\"allow-ff\"); }")]);
+		let found = check(&[("src/a.rs", "fn set(_key: &str) {}\nfn a() { set(\"allow-ff\"); }\nfn b() { set(\"allow-ff\"); }")]);
 		assert!(found["allow-ff"].as_argument);
 	}
 
 	#[test]
 	fn a_parameter_passed_through_a_call_into_a_log_is_a_value() {
 		let found = check(&[(
-			"a.rs",
+			"src/a.rs",
 			"fn store(item: &str) { println!(\"{}\", to_json(item)); }\nfn a() { store(\"originalEventId\"); }\nfn b() { store(\"originalEventId\"); }",
 		)]);
 		assert!(found["originalEventId"].as_argument);
+	}
+
+	#[test]
+	fn module_paths_come_from_files() {
+		let module = |file: &str| module_of(Path::new("pkg"), Path::new(file)).join("::");
+		assert_eq!(module("pkg/src/lib.rs"), "");
+		assert_eq!(module("pkg/src/cli.rs"), "cli");
+		assert_eq!(module("pkg/src/cli/mod.rs"), "cli");
+		assert_eq!(module("pkg/src/cli/log.rs"), "cli::log");
+		assert_eq!(module("pkg/src/bin/tool.rs"), "");
 	}
 }

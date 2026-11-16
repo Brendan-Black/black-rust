@@ -28,7 +28,7 @@ not yours. `#[rustfmt::skip]` on an item is the only way to keep a layout by han
 ## `cargo black`
 
 ```sh
-cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.2.1   # or: --path ~/github/rust/black-rust
+cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.2.2   # or: --path ~/github/rust/black-rust
 ```
 
 | Command | What it does |
@@ -62,7 +62,7 @@ Only identical values match: `"orderId"` matches `"orderId"` and nothing else, n
 | passed as an argument at least once: `get("id")`, `.args(["--all"])`, `vec!["a"]`, `info!(target: "x", ...)` | an error |
 | passed as an argument once, every other use in other files or in that same function | a warning: most likely another concept that shares the spelling, such as one flag in two commands' parsers |
 | only ever in one function, with at most one of its literals an argument (`strip_prefix("--x=")` beside a `"--x=" =>` arm) | not reported: read together, changed together. Two arguments in one function (declaring a flag and looking it up) are still an error |
-| all within `magic-strings-proximity` of each other, with no constant among them: on one line, by default (`starts_with("--author")` and `value("--author")`) | not reported: read together, however many are arguments |
+| all within `magic-strings-proximity` of each other, with no constant among them: in one statement, by default (`_ if arg.starts_with("--author") => value("--author")`) | not reported: read together, however many are arguments |
 | never an argument: `let`, `return`, `==`, match arms | not reported, unless `magic-strings-elsewhere` asks |
 | only ever in `const`s and `static`s | not reported |
 
@@ -75,7 +75,9 @@ messages (the format string of `format!`, `print!`/`println!`/`eprintln!`, `writ
 `expect_err`, `context`, `wrap_err`, `ok_or`, `Err`, and any function of a type whose name ends in `Error`, such as
 `Error::invalid` or `io::Error::other`); the literals of the compile-time macros `env!`, `option_env!`, `include!`,
 `include_str!`, `include_bytes!`, `concat!` and `stringify!`, which name variables and files or build other literals;
-values with no letter; values with whitespace in them; attributes and `extern "C"`; files whose opening comment has a
+values with no letter (a backslash and the letter after it, `"\\t"`, is an escape spelled out); values with whitespace
+in them; the type names, field names and entries of `Debug` output (`f.debug_struct("Diff").field("myers", ..)`, only
+on a chain that starts at a `debug_*` builder); attributes and `extern "C"`; files whose opening comment has a
 line starting `@generated`; and test code: `tests/`, `benches/`, `examples/`, and anything under `#[test]` or
 `#[cfg(test)]`.
 
@@ -84,15 +86,19 @@ a message, like `check("JSON", token)` where `check` only puts it in an `Err`. A
 number of arguments (`Type::f` by its type too); a parameter that is used any other way, or passed to a function that
 isn't known to take a message, is a value.
 
-A package changes both levels in its `Cargo.toml`, and a workspace's root sets them in `[workspace.metadata.black]`
-for every package that doesn't set its own. `sync` keeps the keys when it rewrites the table.
+A package changes these in its `Cargo.toml`, a workspace's root sets them in `[workspace.metadata.black]` for every
+package that doesn't set its own, and a module's table sets them for part of a package. `sync` keeps them all.
 
 ```toml
 [package.metadata.black]
 magic-strings = "warn"              # values passed as arguments: "deny" (default), "warn" or "allow"
 magic-strings-elsewhere = "warn"    # the most a value that is never an argument can be: "allow" (default), "warn" or "deny"
 magic-strings-whitespace = true     # also check values with whitespace in them (default false)
-magic-strings-proximity = 0         # lines a value's literals can span and be read together: 0 (default) is one line; -1 one file, -2 one directory, -3 the package
+magic-strings-proximity = "file"    # how close a value's literals must be to be read together: "statement" (default), "function", "file", "module", "crate"
+
+[package.metadata.black.modules."cli"]  # the module cli and the modules inside it; "cli::log" for one of those
+magic-strings = "warn"
+magic-strings-proximity = "module"
 ```
 
 `magic-strings = "allow"` turns the check off for the package; `magic-strings-elsewhere = "warn"` or `"deny"` also
@@ -101,6 +107,22 @@ Values with whitespace in them (a space, a tab, a newline) are skipped unless `m
 headers and flags have none, so such a value is almost always text for people.
 
 `magic-strings-proximity` says how close a value's literals must all be to be read together, and so not reported, however
-many are arguments: a number of lines (`0`, the default, is one line; `3` is within three lines of each other, in one
-file), `-1` one file, `-2` one directory (a module and its submodules), or `-3` the whole package, which reports nothing. A
-constant among them is never close: a constant plus a literal should use the constant.
+many are arguments. A constant among them is never close: a constant plus a literal should use the constant.
+
+| Proximity | Literals are close when they are all in |
+|---|---|
+| `"statement"` (default) | one statement, or one branch's head and what it leads to: a match arm's pattern and guard with its expression or its block's first statement, an `if`'s condition with its block's first statement. Line breaks don't matter |
+| `"function"` | one function, or one item outside a function |
+| `"file"` | one file |
+| `"module"` | one module below the crate root and the modules inside it (`cli`, `cli::log`), or the root module's own files |
+| `"crate"` | the package: nothing is reported |
+
+A module's table, `[package.metadata.black.modules."cli::log"]` (with or without `crate::`), takes the same four settings
+for that module and the modules inside it. A file's module comes from its path: `src/cli/log.rs` and
+`src/cli/log/mod.rs` are `cli::log`; `src/lib.rs`, `src/main.rs`, `src/bin/*.rs` and `build.rs` are the crate root. The
+longest matching table decides each setting it sets; the rest come from the next module up, then the package, then the
+workspace. A value whose literals are in modules with different settings takes the most severe level and the
+narrowest proximity among them, and a module set to `"allow"` isn't counted at all.
+
+Each finding lists first the places that make it its level: for a value passed as an argument, its arguments and the
+other uses in their files. Uses in files with no argument follow on one line, by file.

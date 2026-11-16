@@ -4,6 +4,7 @@
 //! has a warning. The standards are compiled in, so a project gets a fixed version of them, recorded in its
 //! Cargo.toml, which only changes when it syncs with a newer cargo-black.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -129,63 +130,76 @@ const ERROR_LABEL: &str = "error";
 /// Reports every value repeated in a package's string literals, as an error or a warning by the package's settings, and
 /// says whether there were no errors.
 fn check_magic_strings(workspace: &Workspace) -> Result<bool, String> {
-	use magic_strings::{ELSEWHERE_SETTING, Kind, Level, PROXIMITY_SETTING, Proximity, SETTING, WHITESPACE_SETTING};
+	use magic_strings::{Level, MODULES_TABLE, Policy};
 	let root = workspace.root_manifest()?;
+	let in_workspace = settings_in(item_at(&root, WORKSPACE_BLACK), &format!("[{WORKSPACE_BLACK}]"))?;
 	let mut ok = true;
 	for member in &workspace.members {
 		let manifest = read_manifest(member)?;
-		// The package's own setting, else the workspace's, else the default.
-		let level_of = |key: &str, default: Level| -> Result<Level, String> {
-			let value = match black_setting(&manifest, PACKAGE_BLACK, key)? {
-				Some(value) => Some(value),
-				None => black_setting(&root, WORKSPACE_BLACK, key)?,
-			};
-			value.map_or(Ok(default), |v| Level::parse(key, &v).map_err(|e| format!("{}: {e}", member.display())))
-		};
-		let as_argument = level_of(SETTING, Level::Deny)?;
-		let elsewhere = as_argument.min(level_of(ELSEWHERE_SETTING, Level::Allow)?);
-		let whitespace = match black_item(&manifest, PACKAGE_BLACK, WHITESPACE_SETTING).or_else(|| black_item(&root, WORKSPACE_BLACK, WHITESPACE_SETTING)) {
-			None => false,
-			Some(item) => item.as_bool().ok_or_else(|| format!("{}: {WHITESPACE_SETTING} isn't true or false", member.display()))?,
-		};
-		let proximity = match black_item(&manifest, PACKAGE_BLACK, PROXIMITY_SETTING).or_else(|| black_item(&root, WORKSPACE_BLACK, PROXIMITY_SETTING)) {
-			None => Proximity::Lines(0),
-			Some(item) => {
-				let n = item.as_integer().ok_or_else(|| format!("{}: {PROXIMITY_SETTING} isn't a whole number", member.display()))?;
-				Proximity::parse(n).map_err(|e| format!("{}: {e}", member.display()))?
+		let black = item_at(&manifest, PACKAGE_BLACK);
+		// The package's own settings, else the workspace's, else the defaults; a module's table over its parent's.
+		let package = settings_in(black, &member.display().to_string())?.or(in_workspace);
+		let mut modules = Vec::new();
+		if let Some(tables) = black.and_then(|b| b.get(MODULES_TABLE)) {
+			let tables = tables.as_table_like().ok_or_else(|| format!("{}: [{PACKAGE_BLACK}.{MODULES_TABLE}] isn't a table", member.display()))?;
+			for (path, table) in tables.iter() {
+				modules.push((path.to_owned(), settings_in(Some(table), &format!("{} [{PACKAGE_BLACK}.{MODULES_TABLE}.\"{path}\"]", member.display()))?));
 			}
-		};
-		if as_argument == Level::Allow {
-			continue;
 		}
+		let policy = Policy::new(package, modules);
 		let dir = member.parent().ok_or("a package manifest has no directory")?;
-		for (value, finding) in magic_strings::findings(dir, whitespace, proximity)? {
-			// A lone argument, likely another concept sharing the spelling, is at most a warning.
-			let level = match (finding.as_argument, finding.lone_argument) {
-				(true, true) => as_argument.min(Level::Warn),
-				(true, false) => as_argument,
-				(false, _) => elsewhere,
-			};
-			let label = match level {
-				Level::Allow => continue,
-				Level::Warn => WARNING_LABEL,
-				Level::Deny => ERROR_LABEL,
-			};
-			let arguments = finding.places.iter().filter(|p| p.kind == Kind::Argument).count();
+		for (value, finding) in magic_strings::findings(dir, &policy)? {
+			let label = if finding.level == Level::Deny { ERROR_LABEL } else { WARNING_LABEL };
+			let arguments = finding.places.iter().filter(|p| p.kind == magic_strings::Kind::Argument).count();
 			eprintln!("{label}: magic string {value:?} appears {} times, {arguments} as an argument: name it (black values/magic-strings)", finding.places.len());
-			for place in &finding.places {
-				let file = place.file.strip_prefix(&workspace.root).unwrap_or(&place.file);
+			let relative = |file: &'_ Path| file.strip_prefix(&workspace.root).unwrap_or(file).display().to_string();
+			let (shown, rest) = finding.triggering();
+			for place in shown {
 				let kind = match place.kind {
-					Kind::Argument => "argument",
-					Kind::Definition => "definition",
-					Kind::Elsewhere => "elsewhere",
+					magic_strings::Kind::Argument => "argument",
+					magic_strings::Kind::Definition => "definition",
+					magic_strings::Kind::Elsewhere => "elsewhere",
 				};
-				eprintln!("  {}:{}:{} ({kind})", file.display(), place.line, place.column);
+				eprintln!("  {}:{}:{} ({kind})", relative(&place.file), place.line, place.column);
 			}
-			ok &= level != Level::Deny;
+			if !rest.is_empty() {
+				// Uses in files with no argument don't make it this level: listed by file, not one by one.
+				let mut files: BTreeMap<String, usize> = BTreeMap::new();
+				rest.iter().for_each(|p| *files.entry(relative(&p.file)).or_default() += 1);
+				let listed: Vec<String> = files.iter().map(|(file, n)| format!("{file} ({n})")).collect();
+				eprintln!("  also, not passed as an argument there: {}", listed.join(", "));
+			}
+			ok &= finding.level != Level::Deny;
 		}
 	}
 	Ok(ok)
+}
+
+/// The magic-string settings in one table, if it is there; `place` names it in errors.
+fn settings_in(table: Option<&toml_edit::Item>, place: &str) -> Result<magic_strings::Settings, String> {
+	use magic_strings::{ELSEWHERE_SETTING, Level, PROXIMITY_SETTING, Proximity, SETTING, Settings, WHITESPACE_SETTING};
+	let Some(table) = table else { return Ok(Settings::default()) };
+	let text = |key: &str| -> Result<Option<String>, String> {
+		table.get(key).map(|v| v.as_str().map(str::to_owned).ok_or_else(|| format!("{place}: {key} isn't a string"))).transpose()
+	};
+	let with_place = |e: String| format!("{place}: {e}");
+	if let Some(n) = table.get(PROXIMITY_SETTING).and_then(toml_edit::Item::as_integer) {
+		// 0.2.1 took a number of lines; that let the formatter decide what was close.
+		return Err(format!(
+			"{place}: {PROXIMITY_SETTING} is {n}, a number of lines; it is a word now: \"statement\" (the default), \"function\", \"file\", \"module\" or \"crate\""
+		));
+	}
+	Ok(Settings {
+		level: text(SETTING)?.map(|v| Level::parse(SETTING, &v)).transpose().map_err(with_place)?,
+		elsewhere: text(ELSEWHERE_SETTING)?.map(|v| Level::parse(ELSEWHERE_SETTING, &v)).transpose().map_err(with_place)?,
+		whitespace: table.get(WHITESPACE_SETTING).map(|v| v.as_bool().ok_or_else(|| format!("{place}: {WHITESPACE_SETTING} isn't true or false"))).transpose()?,
+		proximity: text(PROXIMITY_SETTING)?.map(|v| Proximity::parse(&v)).transpose().map_err(with_place)?,
+	})
+}
+
+/// The dotted `table`, if it is there.
+fn item_at<'a>(doc: &'a DocumentMut, table: &str) -> Option<&'a toml_edit::Item> {
+	table.split('.').try_fold(doc.as_item(), |item, part| item.get(part))
 }
 
 /// The cargo that ran cargo black, or the one on the PATH.
@@ -285,6 +299,19 @@ impl Workspace {
 		for key in [magic_strings::SETTING, magic_strings::ELSEWHERE_SETTING, magic_strings::WHITESPACE_SETTING, magic_strings::PROXIMITY_SETTING] {
 			if let Some(value) = black_item(&doc, owner, key).and_then(toml_edit::Item::as_value) {
 				level.push_str(&format!("{key} = {}\n", value.to_string().trim()));
+			}
+		}
+		// So are its modules' tables, which live under it in a package (a workspace's members keep theirs untouched).
+		if owner == PACKAGE_BLACK
+			&& let Some(modules) = item_at(&doc, PACKAGE_BLACK).and_then(|b| b.get(magic_strings::MODULES_TABLE)).and_then(toml_edit::Item::as_table_like)
+		{
+			for (path, table) in modules.iter() {
+				level.push_str(&format!("\n[{PACKAGE_BLACK}.{}.\"{path}\"]\n", magic_strings::MODULES_TABLE));
+				for (key, value) in table.as_table_like().into_iter().flat_map(|t| t.iter()) {
+					if let Some(value) = value.as_value() {
+						level.push_str(&format!("{key} = {}\n", value.to_string().trim()));
+					}
+				}
 			}
 		}
 		if owner == WORKSPACE_BLACK {
