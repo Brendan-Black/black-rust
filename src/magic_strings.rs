@@ -9,15 +9,22 @@
 //! `.args(["--all"])`): the biggest offenders, so a value with an argument among its literals gets the package's full
 //! level. A *definition* is inside a `const` or `static`: a value whose literals are all definitions is two names that
 //! happen to share a spelling, and isn't reported. Everything else (assignments, returns, comparisons, match arms) is
-//! *elsewhere*, and a value seen only there and in definitions is capped at the `magic-strings-elsewhere` level.
+//! *elsewhere*, and a value seen only there and in definitions is capped at the `magic-strings-elsewhere` level. A
+//! literal in a constructor (`Some("x")`, `Ok("x")`) is an argument only if the constructor is passed on.
+//!
+//! Two shapes are eased. A value whose literals are all in one function, with at most one of them an argument, isn't
+//! reported: a parser's `strip_prefix("--x=")` beside its `"--x=" =>` arm is read and changed together. And a value
+//! passed as an argument just once, with every other use in other files (or in that same function), is at most a
+//! warning: it is most likely another concept that shares the spelling, such as one flag in two commands' parsers.
 //!
 //! Not counted at all: values with no letter (`", "`, `"\n"`, `"404"`); values with whitespace in them, unless
 //! `magic-strings-whitespace` is true; messages (the format string of `format!`, `println!`, `panic!`, `write!`, the
 //! `assert` macros and the logging macros, and what is formatted into it; the arguments of `expect`, `context`,
-//! `ok_or`, `Err`, and any function of a type whose name ends in `Error`, such as `io::Error::other`); attributes and
-//! `extern "C"`; labels (a literal passed straight to a parameter of the package's own functions that only reaches a
-//! message: see [`message_params`]); generated files (a line of the opening comment that starts with `@generated`); and test code
-//! (`tests/`, `benches/`, `examples/`, and items marked `#[test]` or `#[cfg(test)]`).
+//! `ok_or`, `Err`, and any function of a type whose name ends in `Error`, such as `io::Error::other`); the literals of
+//! compile-time macros such as `env!` and `include_str!`; attributes and `extern "C"`; labels (a literal passed straight
+//! to a parameter of the package's own functions that only reaches a message: see [`message_params`]); generated files
+//! (a line of the opening comment that starts with `@generated`); and test code (`tests/`, `benches/`, `examples/`, and
+//! items marked `#[test]` or `#[cfg(test)]`).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -46,6 +53,50 @@ pub const ELSEWHERE_SETTING: &str = "magic-strings-elsewhere";
 /// Whether values with whitespace in them are checked, set the same way: `true` or `false`. False by default: a key, a
 /// header or a flag has none, so a value with a space or a newline is almost always text for people.
 pub const WHITESPACE_SETTING: &str = "magic-strings-whitespace";
+/// How close a value's literals must all be to be read together, and so not reported, set the same way: a number of
+/// lines (0, the default, is one line), or -1 for one file, -2 for one directory (a module and its submodules), -3 for
+/// the whole package.
+pub const PROXIMITY_SETTING: &str = "magic-strings-proximity";
+
+/// How close a value's literals must all be to be read together. A constant among them is never close: a constant plus
+/// a literal should use the constant.
+#[derive(Clone, Copy)]
+pub enum Proximity {
+	/// Within this many lines of each other, in one file: 0 is one line.
+	Lines(usize),
+	File,
+	/// One directory: a module and its submodules.
+	Directory,
+	/// The whole package, so no value is reported.
+	Package,
+}
+
+impl Proximity {
+	pub fn parse(n: i64) -> Result<Self, String> {
+		match n {
+			-1 => Ok(Self::File),
+			-2 => Ok(Self::Directory),
+			-3 => Ok(Self::Package),
+			_ => usize::try_from(n).map(Self::Lines).map_err(|_| format!("{PROXIMITY_SETTING} is {n}; expected a number of lines (0 or more), -1, -2 or -3")),
+		}
+	}
+
+	/// Whether these literals are all this close.
+	fn holds(self, places: &[Place]) -> bool {
+		let Some(first) = places.first() else { return false };
+		let same_file = places.iter().all(|p| p.file == first.file);
+		match self {
+			Self::Lines(n) => {
+				let low = places.iter().map(|p| p.line).min().unwrap_or(first.line);
+				let high = places.iter().map(|p| p.line).max().unwrap_or(first.line);
+				same_file && high - low <= n
+			}
+			Self::File => same_file,
+			Self::Directory => places.iter().all(|p| p.file.parent() == first.file.parent()),
+			Self::Package => true,
+		}
+	}
+}
 
 /// Each level by the word a manifest uses for it.
 const LEVELS: [(&str, Level); 3] = [("deny", Level::Deny), ("warn", Level::Warn), ("allow", Level::Allow)];
@@ -67,22 +118,27 @@ pub enum Kind {
 	Elsewhere,
 }
 
-/// Where a literal is: its file, its 1-based line and column, and its kind.
+/// Where a literal is: its file, its 1-based line and column, its kind, and the function (or other item) it is in.
 pub struct Place {
 	pub file: PathBuf,
 	pub line: usize,
 	pub column: usize,
 	pub kind: Kind,
+	/// The function, or other item outside one, the literal is in: unique across the package.
+	pub scope: usize,
 }
 
-/// A value to report: where it appears, and whether any of those is an argument.
+/// A value to report: where it appears, whether any of those is an argument, and whether that argument is alone.
 pub struct Finding {
 	pub places: Vec<Place>,
 	pub as_argument: bool,
+	/// One argument, every other use being outside its file (or in its own function): most likely another concept
+	/// that shares the spelling, such as one flag in two commands' parsers, so it is reported at most as a warning.
+	pub lone_argument: bool,
 }
 
 /// Every value to report in the package's non-test code, sorted by value.
-pub fn findings(package_dir: &Path, whitespace: bool) -> Result<BTreeMap<String, Finding>, String> {
+pub fn findings(package_dir: &Path, whitespace: bool, proximity: Proximity) -> Result<BTreeMap<String, Finding>, String> {
 	let mut files = Vec::new();
 	collect_files(package_dir, true, &mut files)?;
 	files.sort();
@@ -99,22 +155,44 @@ pub fn findings(package_dir: &Path, whitespace: bool) -> Result<BTreeMap<String,
 		parsed.push((file, syntax));
 	}
 	parsed.retain(|(file, _)| !test_modules.iter().any(|m| file.starts_with(m)));
+	Ok(findings_in(&parsed, whitespace, proximity))
+}
+
+/// Every value to report in these parsed files, sorted by value.
+fn findings_in(parsed: &[(PathBuf, syn::File)], whitespace: bool, proximity: Proximity) -> BTreeMap<String, Finding> {
 	let messages = MessageParams::of(&parsed.iter().map(|(_, syntax)| syntax).collect::<Vec<_>>());
 	let mut seen: BTreeMap<String, Vec<Place>> = BTreeMap::new();
-	for (file, syntax) in &parsed {
-		let mut finder = Finder { file, seen: &mut seen, in_definition: false, whitespace, messages: &messages, owner: None };
+	let mut scopes = 0;
+	for (file, syntax) in parsed {
+		let mut finder = Finder { file, seen: &mut seen, in_definition: false, whitespace, messages: &messages, owner: None, scope: 0, scopes: &mut scopes };
+		finder.new_scope();
 		finder.visit_file(syntax);
 	}
-	Ok(
-		seen
-			.into_iter()
-			.filter(|(_, places)| places.len() > 1 && places.iter().any(|p| p.kind != Kind::Definition))
-			.map(|(value, places)| {
-				let as_argument = places.iter().any(|p| p.kind == Kind::Argument);
-				(value, Finding { places, as_argument })
-			})
-			.collect(),
-	)
+	seen.into_iter().filter_map(|(value, places)| finding(places, proximity).map(|f| (value, f))).collect()
+}
+
+/// What to report of a value's literals, if anything: not a value seen once, nor one whose literals are all definitions,
+/// nor one whose literals are all in one function (or other item) with at most one of them an argument, where they are
+/// read together and change together.
+fn finding(places: Vec<Place>, proximity: Proximity) -> Option<Finding> {
+	// One function's literals are exempt only with at most one argument among them: two (declaring a flag and looking it
+	// up, or writing a key and reading it) are the typo the rule is for.
+	let arguments_in_all = places.iter().filter(|p| p.kind == Kind::Argument).count();
+	let one_scope = places.iter().all(|p| p.scope == places[0].scope) && arguments_in_all <= 1;
+	// Literals this close, however many are arguments, are read together: `starts_with("--x")` and `value("--x")` on one
+	// parser line. Not with a constant among them, though: a constant plus a literal should use the constant.
+	let close = places.iter().all(|p| p.kind != Kind::Definition) && proximity.holds(&places);
+	if places.len() < 2 || places.iter().all(|p| p.kind == Kind::Definition) || one_scope || close {
+		return None;
+	}
+	let mut arguments = places.iter().filter(|p| p.kind == Kind::Argument);
+	let first = arguments.next();
+	let lone_argument = match (first, arguments.next()) {
+		(Some(argument), None) => places.iter().all(|p| p.scope == argument.scope || p.file != argument.file),
+		_ => false,
+	};
+	let as_argument = first.is_some();
+	Some(Finding { places, as_argument, lone_argument })
 }
 
 /// Files that are modules' roots, so their `mod x;` is a sibling `x.rs` rather than one in a directory named after them.
@@ -211,6 +289,18 @@ fn is_message_call(func: &syn::Expr) -> bool {
 	last || segments.next().is_some_and(|s| s.ident.to_string().ends_with(ERROR_TYPE_SUFFIX))
 }
 
+/// Whether a call builds a value rather than doing something with one: a tuple struct or enum variant, such as
+/// `Some(..)`, `Ok(..)` or `Mode::Named(..)`, by the capital its path ends with. A literal it wraps is passed on only
+/// if the value it builds is.
+fn is_constructor(func: &syn::Expr) -> bool {
+	let syn::Expr::Path(p) = func else { return false };
+	p.path.segments.last().is_some_and(|s| s.ident.to_string().starts_with(char::is_uppercase))
+}
+
+/// Macros that read their literals at compile time, as names of environment variables and files or as pieces of
+/// another literal: `env!("CARGO_PKG_VERSION")` names no value of the program's.
+const COMPILE_TIME_MACROS: [&str; 7] = ["env", "option_env", "include", "include_str", "include_bytes", "concat", "stringify"];
+
 /// Which of a macro's comma-separated arguments is its message, if it has one.
 enum Message {
 	At(usize),
@@ -246,16 +336,33 @@ struct Finder<'a> {
 	messages: &'a MessageParams,
 	/// The type of the `impl` being visited, which `Self` stands for.
 	owner: Option<String>,
+	/// The function (or other item) being visited.
+	scope: usize,
+	/// How many scopes the package has had, so each gets its own number.
+	scopes: &'a mut usize,
 }
 
 impl Finder<'_> {
+	/// Enter a scope of its own, returning the one it was in.
+	fn new_scope(&mut self) -> usize {
+		*self.scopes += 1;
+		std::mem::replace(&mut self.scope, *self.scopes)
+	}
+
+	/// Visit an item in a scope of its own.
+	fn in_scope(&mut self, visit: impl FnOnce(&mut Self)) {
+		let outer = self.new_scope();
+		visit(self);
+		self.scope = outer;
+	}
+
 	fn record(&mut self, value: String, span: proc_macro2::Span, kind: Kind) {
 		if !value.chars().any(char::is_alphabetic) || (!self.whitespace && value.chars().any(char::is_whitespace)) {
 			return;
 		}
 		let kind = if self.in_definition { Kind::Definition } else { kind };
 		let start = span.start();
-		self.seen.entry(value).or_default().push(Place { file: self.file.to_owned(), line: start.line, column: start.column + 1, kind });
+		self.seen.entry(value).or_default().push(Place { file: self.file.to_owned(), line: start.line, column: start.column + 1, kind, scope: self.scope });
 	}
 
 	/// An expression passed to a call: a string literal in it is an argument, also inside `&`, `( )`, `[ ]` and tuples.
@@ -266,6 +373,8 @@ impl Finder<'_> {
 			syn::Expr::Paren(p) => self.argument(&p.expr),
 			syn::Expr::Array(a) => a.elems.iter().for_each(|e| self.argument(e)),
 			syn::Expr::Tuple(t) => t.elems.iter().for_each(|e| self.argument(e)),
+			// `Some("x")` passed on is still passed on.
+			syn::Expr::Call(c) if is_constructor(&c.func) => c.args.iter().for_each(|e| self.argument(e)),
 			other => self.visit_expr(other),
 		}
 	}
@@ -348,6 +457,11 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 		if is_message_call(&call.func) {
 			return;
 		}
+		// A value wrapped (`Some("hard")`, `Ok("x")`, `Mode::Named("x")`) is only passed on if the wrapper is.
+		if is_constructor(&call.func) {
+			call.args.iter().for_each(|arg| self.visit_expr(arg));
+			return;
+		}
 		let path = match &*call.func {
 			syn::Expr::Path(p) => Some(&p.path),
 			_ => None,
@@ -374,6 +488,9 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 
 	fn visit_macro(&mut self, mac: &'ast syn::Macro) {
 		let (name, arguments, counted) = macro_arguments(mac);
+		if COMPILE_TIME_MACROS.contains(&name.as_str()) {
+			return;
+		}
 		for (i, argument) in arguments.into_iter().take(counted).enumerate() {
 			// `matches!(x, "a" | "b")` is a match: its patterns and guard are match arms, not arguments.
 			let kind = if name == MATCHES && i > 0 { Kind::Elsewhere } else { Kind::Argument };
@@ -411,9 +528,18 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 	}
 
 	fn visit_item(&mut self, item: &'ast syn::Item) {
-		if !is_test(item_attrs(item)) {
-			visit::visit_item(self, item);
+		if is_test(item_attrs(item)) {
+			return;
 		}
+		// An item holding items gives each its own scope; any other item is a scope of its own.
+		match item {
+			syn::Item::Mod(_) | syn::Item::Impl(_) | syn::Item::Trait(_) | syn::Item::ForeignMod(_) => visit::visit_item(self, item),
+			_ => self.in_scope(|f| visit::visit_item(f, item)),
+		}
+	}
+
+	fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+		self.in_scope(|f| visit::visit_trait_item(f, item));
 	}
 
 	fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
@@ -425,7 +551,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 			_ => &[],
 		};
 		if !is_test(attrs) {
-			visit::visit_impl_item(self, item);
+			self.in_scope(|f| visit::visit_impl_item(f, item));
 		}
 	}
 }
@@ -467,4 +593,121 @@ fn mentions_test(tokens: proc_macro2::TokenStream) -> bool {
 		proc_macro2::TokenTree::Group(group) => mentions_test(group.stream()),
 		proc_macro2::TokenTree::Literal(_) | proc_macro2::TokenTree::Punct(_) => false,
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The findings in these files, each given as its path and source.
+	fn check(files: &[(&str, &str)]) -> BTreeMap<String, Finding> {
+		let parsed: Vec<(PathBuf, syn::File)> = files.iter().map(|(path, text)| (PathBuf::from(path), syn::parse_file(text).unwrap())).collect();
+		findings_in(&parsed, false, Proximity::Lines(0))
+	}
+
+	#[test]
+	fn a_value_passed_from_two_functions_is_reported() {
+		let found = check(&[("a.rs", "fn put() { set(\"allow-ff\"); }\nfn get() { read(\"allow-ff\"); }")]);
+		assert!(found["allow-ff"].as_argument && !found["allow-ff"].lone_argument);
+	}
+
+	#[test]
+	fn literals_in_one_function_are_not() {
+		let found = check(&[("a.rs", "fn parse(a: &str) { if let Some(v) = a.strip_prefix(\"--abbrev=\") {} match a { \"--abbrev=\" => {}, _ => {} } }")]);
+		assert!(found.is_empty());
+	}
+
+	#[test]
+	fn two_arguments_in_one_function_are_reported() {
+		let found = check(&[("a.rs", "fn run(rest: &[&str]) {\nlet a = parse(rest, &[(\"allow-http\", 0)]);\nif a.has(\"allow-http\") {}\n}")]);
+		assert!(found["allow-http"].as_argument && !found["allow-http"].lone_argument);
+	}
+
+	/// The findings in one file at a proximity.
+	fn check_at(text: &str, proximity: Proximity) -> BTreeMap<String, Finding> {
+		findings_in(&[(PathBuf::from("a.rs"), syn::parse_file(text).unwrap())], false, proximity)
+	}
+
+	#[test]
+	fn arguments_on_one_line_are_read_together() {
+		let found = check(&[("a.rs", "fn parse(arg: &str) { if arg.starts_with(\"--author\") { value(\"--author\"); } }")]);
+		assert!(found.is_empty());
+	}
+
+	#[test]
+	fn proximity_widens_what_is_read_together() {
+		let text = "fn put() {\nset(\"allow-ff\");\n}\nfn get() {\nread(\"allow-ff\");\n}";
+		assert!(check_at(text, Proximity::Lines(0)).contains_key("allow-ff"));
+		assert!(check_at(text, Proximity::Lines(2)).contains_key("allow-ff"));
+		assert!(check_at(text, Proximity::Lines(3)).is_empty());
+		assert!(check_at(text, Proximity::File).is_empty());
+		let two_files = [("a/x.rs", "fn put() { set(\"allow-ff\"); }"), ("a/y.rs", "fn get() { read(\"allow-ff\"); }")];
+		let parsed: Vec<(PathBuf, syn::File)> = two_files.iter().map(|(p, t)| (PathBuf::from(p), syn::parse_file(t).unwrap())).collect();
+		assert!(findings_in(&parsed, false, Proximity::File).contains_key("allow-ff"));
+		assert!(findings_in(&parsed, false, Proximity::Directory).is_empty());
+	}
+
+	#[test]
+	fn a_constant_is_never_close() {
+		let found = check(&[("a.rs", "const KEY: &str = \"allow-ff\"; fn a() { set(\"allow-ff\"); }")]);
+		assert!(found.contains_key("allow-ff"));
+		assert!(Proximity::parse(-4).is_err() && Proximity::parse(5).is_ok());
+	}
+
+	#[test]
+	fn arrays_passed_on_stay_arguments() {
+		let found = check(&[("a.rs", "fn a() { c.args([\"--all\"]); }\nfn b() { d.args(vec![\"--all\"]); }")]);
+		assert!(found["--all"].as_argument);
+	}
+
+	#[test]
+	fn a_wrapped_value_returned_is_not_an_argument() {
+		let found = check(&[("a.rs", "fn name() -> Option<&'static str> { Some(\"hard\") }\nfn is(a: &str) -> bool { a == \"hard\" }")]);
+		assert!(!found["hard"].as_argument);
+		// Passed on, it still is.
+		let found = check(&[("a.rs", "fn one() { f(Some(\"hard\")); }\nfn two() { g(\"hard\"); }")]);
+		assert!(found["hard"].as_argument);
+	}
+
+	#[test]
+	fn compile_time_macros_are_not_counted() {
+		let found = check(&[("a.rs", "fn a() { f(env!(\"CARGO_PKG_VERSION\")); }\nfn b() { g(env!(\"CARGO_PKG_VERSION\")); }")]);
+		assert!(found.is_empty());
+	}
+
+	#[test]
+	fn a_lone_argument_among_other_files_uses_is_marked() {
+		let found = check(&[
+			("a.rs", "fn quiet(a: &str) { f(\"-q\"); match a { \"-q\" => {}, _ => {} } }"),
+			("b.rs", "fn parse(a: &str) { match a { \"-q\" => {}, _ => {} } }"),
+		]);
+		assert!(found["-q"].lone_argument);
+		// Another use in the argument's own file, outside its function, is the same concept as far as anyone can tell.
+		let found = check(&[("a.rs", "fn one() { f(\"-q\"); }\nfn two(a: &str) { match a { \"-q\" => {}, _ => {} } }")]);
+		assert!(!found["-q"].lone_argument);
+	}
+
+	#[test]
+	fn a_label_is_not_counted() {
+		let found = check(&[(
+			"a.rs",
+			"fn check(fmt: &str) -> Result<(), Error> { Err(Error::invalid(format!(\"{fmt} is bad\"))) }\nfn a() { check(\"JSON\"); }\nfn b() { check(\"JSON\"); }",
+		)]);
+		assert!(found.is_empty());
+	}
+
+	#[test]
+	fn an_unused_parameter_is_not_a_message() {
+		let found = check(&[("a.rs", "fn set(_key: &str) {}\nfn a() { set(\"allow-ff\"); }\nfn b() { set(\"allow-ff\"); }")]);
+		assert!(found["allow-ff"].as_argument);
+	}
+
+	#[test]
+	fn a_parameter_passed_through_a_call_into_a_log_is_a_value() {
+		let found = check(&[(
+			"a.rs",
+			"fn store(item: &str) { println!(\"{}\", to_json(item)); }\nfn a() { store(\"originalEventId\"); }\nfn b() { store(\"originalEventId\"); }",
+		)]);
+		assert!(found["originalEventId"].as_argument);
+	}
 }

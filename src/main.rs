@@ -129,7 +129,7 @@ const ERROR_LABEL: &str = "error";
 /// Reports every value repeated in a package's string literals, as an error or a warning by the package's settings, and
 /// says whether there were no errors.
 fn check_magic_strings(workspace: &Workspace) -> Result<bool, String> {
-	use magic_strings::{ELSEWHERE_SETTING, Kind, Level, SETTING, WHITESPACE_SETTING};
+	use magic_strings::{ELSEWHERE_SETTING, Kind, Level, PROXIMITY_SETTING, Proximity, SETTING, WHITESPACE_SETTING};
 	let root = workspace.root_manifest()?;
 	let mut ok = true;
 	for member in &workspace.members {
@@ -148,12 +148,24 @@ fn check_magic_strings(workspace: &Workspace) -> Result<bool, String> {
 			None => false,
 			Some(item) => item.as_bool().ok_or_else(|| format!("{}: {WHITESPACE_SETTING} isn't true or false", member.display()))?,
 		};
+		let proximity = match black_item(&manifest, PACKAGE_BLACK, PROXIMITY_SETTING).or_else(|| black_item(&root, WORKSPACE_BLACK, PROXIMITY_SETTING)) {
+			None => Proximity::Lines(0),
+			Some(item) => {
+				let n = item.as_integer().ok_or_else(|| format!("{}: {PROXIMITY_SETTING} isn't a whole number", member.display()))?;
+				Proximity::parse(n).map_err(|e| format!("{}: {e}", member.display()))?
+			}
+		};
 		if as_argument == Level::Allow {
 			continue;
 		}
 		let dir = member.parent().ok_or("a package manifest has no directory")?;
-		for (value, finding) in magic_strings::findings(dir, whitespace)? {
-			let level = if finding.as_argument { as_argument } else { elsewhere };
+		for (value, finding) in magic_strings::findings(dir, whitespace, proximity)? {
+			// A lone argument, likely another concept sharing the spelling, is at most a warning.
+			let level = match (finding.as_argument, finding.lone_argument) {
+				(true, true) => as_argument.min(Level::Warn),
+				(true, false) => as_argument,
+				(false, _) => elsewhere,
+			};
 			let label = match level {
 				Level::Allow => continue,
 				Level::Warn => WARNING_LABEL,
@@ -270,7 +282,7 @@ impl Workspace {
 		let owner = owner(&doc);
 		// The project's own magic-strings settings live in the table sync rewrites, so they are carried over, as written.
 		let mut level = String::new();
-		for key in [magic_strings::SETTING, magic_strings::ELSEWHERE_SETTING, magic_strings::WHITESPACE_SETTING] {
+		for key in [magic_strings::SETTING, magic_strings::ELSEWHERE_SETTING, magic_strings::WHITESPACE_SETTING, magic_strings::PROXIMITY_SETTING] {
 			if let Some(value) = black_item(&doc, owner, key).and_then(toml_edit::Item::as_value) {
 				level.push_str(&format!("{key} = {}\n", value.to_string().trim()));
 			}

@@ -39,4 +39,4 @@ with `check.command = "clippy"`.
 | Messages for the person debugging | Clippy's `unwrap_used` (tests may unwrap) |
 | No null across boundaries; no nullable optional | The language: there is no null |
 | Exhaustive handling of outcomes | The compiler: `match` on an enum |
-| Name magic strings | `cargo black check`: a string value repeated in a package's non-test code is an error if it is ever passed as an argument, and not reported otherwise; `magic-strings`, `magic-strings-elsewhere` and `magic-strings-whitespace` change that ([README](../README.md#magic-strings)) |
+| Name magic strings | `cargo black check`: a string value repeated in a package's non-test code is an error if it is ever passed as an argument, and not reported otherwise; `magic-strings`, `magic-strings-elsewhere`, `magic-strings-whitespace` and `magic-strings-proximity` change that ([README](../README.md#magic-strings)) |

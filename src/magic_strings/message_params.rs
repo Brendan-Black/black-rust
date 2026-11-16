@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use syn::visit::{self, Visit};
 
-use super::{MESSAGE_METHODS, is_message_call, is_test, item_attrs, macro_arguments};
+use super::{MESSAGE_METHODS, is_lone_string, is_message_call, is_test, item_attrs, macro_arguments};
 
 /// A function as calls name it. `owner` is the type of an associated function without `self` (`Type::f(..)`), and
 /// `None` for free functions and for methods, which a call names by `.f(..)` alone.
@@ -44,9 +44,10 @@ impl MessageParams {
 					owner: f.owner(),
 					in_message: false,
 					outside: HashSet::new(),
+					seen: HashSet::new(),
 				};
 				uses.visit_block(f.body);
-				f.params.iter().map(|p| p.as_ref().is_some_and(|name| !uses.outside.contains(name.as_str()))).collect()
+				f.params.iter().map(|p| p.as_ref().is_some_and(|name| uses.seen.contains(name.as_str()) && !uses.outside.contains(name.as_str()))).collect()
 			});
 			if next == params {
 				return params;
@@ -196,13 +197,19 @@ struct Uses<'a> {
 	owner: Option<&'a str>,
 	in_message: bool,
 	outside: HashSet<String>,
+	/// Every parameter used at all: one that never is isn't a message either, since nothing shows what it is for.
+	seen: HashSet<String>,
 }
 
 impl Uses<'_> {
 	fn used(&mut self, name: String) {
-		if !self.in_message && self.names.contains(name.as_str()) {
-			self.outside.insert(name);
+		if !self.names.contains(name.as_str()) {
+			return;
 		}
+		if !self.in_message {
+			self.outside.insert(name.clone());
+		}
+		self.seen.insert(name);
 	}
 
 	/// Visits an argument, as a message or not. A call inside a message decides afresh for its own arguments: passed to
@@ -266,16 +273,31 @@ impl<'ast> Visit<'ast> for Uses<'_> {
 	fn visit_macro(&mut self, mac: &'ast syn::Macro) {
 		let (name, arguments, counted) = macro_arguments(mac);
 		let builds_string = STRING_MACROS.contains(&name.as_str());
-		if builds_string && self.in_message {
-			// Formatted into a message: `Err(format!(..))`.
-			return;
-		}
-		// `format!` and `write!` build strings that are often values (a path, a key, a tag), so what goes into them is
-		// used. Any other macro's arguments, but a message macro's message, are used too.
-		let counted = if builds_string { arguments.len() } else { counted };
+		// Formatted into a message (`Err(format!(..))`), all of it is message. Otherwise `format!` and `write!` build
+		// strings that are often values (a path, a key, a tag), so what goes into them is used; and so are any other
+		// macro's arguments, but for a message macro's message and what is formatted into it.
+		let counted = if builds_string { if self.in_message { 0 } else { arguments.len() } } else { counted };
 		let outer = self.in_message;
-		self.in_message = false;
-		arguments.into_iter().take(counted).for_each(|argument| self.tokens(argument));
+		for (i, argument) in arguments.into_iter().enumerate() {
+			if i < counted || is_lone_string(&argument) {
+				// Before the message, a use; the format string itself, a message (its captures, `"{name}"`, included).
+				self.in_message = i >= counted;
+				self.tokens(argument);
+				continue;
+			}
+			// What is formatted into the message is visited as an expression, so a call on the way decides for itself:
+			// `println!("{}", to_json(item))` uses `item`. What isn't one (`key = value` fields) counts as a use.
+			match syn::parse2::<syn::Expr>(argument.clone()) {
+				Ok(expr) => {
+					self.in_message = true;
+					<Self as Visit<'_>>::visit_expr(self, &expr);
+				}
+				Err(_) => {
+					self.in_message = false;
+					self.tokens(argument);
+				}
+			}
+		}
 		self.in_message = outer;
 	}
 

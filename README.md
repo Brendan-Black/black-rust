@@ -28,7 +28,7 @@ not yours. `#[rustfmt::skip]` on an item is the only way to keep a layout by han
 ## `cargo black`
 
 ```sh
-cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.2.0   # or: --path ~/github/rust/black-rust
+cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.2.1   # or: --path ~/github/rust/black-rust
 ```
 
 | Command | What it does |
@@ -60,17 +60,24 @@ Only identical values match: `"orderId"` matches `"orderId"` and nothing else, n
 | A repeated value… | Is |
 |---|---|
 | passed as an argument at least once: `get("id")`, `.args(["--all"])`, `vec!["a"]`, `info!(target: "x", ...)` | an error |
+| passed as an argument once, every other use in other files or in that same function | a warning: most likely another concept that shares the spelling, such as one flag in two commands' parsers |
+| only ever in one function, with at most one of its literals an argument (`strip_prefix("--x=")` beside a `"--x=" =>` arm) | not reported: read together, changed together. Two arguments in one function (declaring a flag and looking it up) are still an error |
+| all within `magic-strings-proximity` of each other, with no constant among them: on one line, by default (`starts_with("--author")` and `value("--author")`) | not reported: read together, however many are arguments |
 | never an argument: `let`, `return`, `==`, match arms | not reported, unless `magic-strings-elsewhere` asks |
 | only ever in `const`s and `static`s | not reported |
 
-Rust specifics: a literal is an argument when it is passed straight to a call, or inside `&`, `( )`, `[ ]` or a tuple
-there; every literal in a macro call is an argument, except the message. Not counted: messages (the format string of
-`format!`, `print!`/`println!`/`eprintln!`, `write!`, `panic!`, `assert!` and its kin, `anyhow!`/`bail!`/`ensure!`
-and the `log`/`tracing` macros, and what is formatted into it; the arguments of `expect`, `expect_err`, `context`,
-`wrap_err`, `ok_or`, `Err`, and any function of a type whose name ends in `Error`, such as `Error::invalid` or
-`io::Error::other`); values with no letter; values with whitespace in them; attributes and `extern "C"`;
-files whose opening comment has a line starting `@generated`; and test code: `tests/`, `benches/`, `examples/`, and
-anything under `#[test]` or `#[cfg(test)]`.
+Rust specifics: a literal is an argument when it is passed straight to a call, or inside `&`, `( )`, `[ ]`, a tuple
+or a constructor there (`Some(..)`, `Ok(..)`, a tuple struct or variant). A constructor's literal is otherwise
+elsewhere, so `Some("hard")` returned from a function is not an argument. Every literal in a macro call is an argument,
+except the message. A function is any `fn`, and a literal outside one belongs to the item it is in. Not counted:
+messages (the format string of `format!`, `print!`/`println!`/`eprintln!`, `write!`, `panic!`, `assert!` and its kin,
+`anyhow!`/`bail!`/`ensure!` and the `log`/`tracing` macros, and what is formatted into it; the arguments of `expect`,
+`expect_err`, `context`, `wrap_err`, `ok_or`, `Err`, and any function of a type whose name ends in `Error`, such as
+`Error::invalid` or `io::Error::other`); the literals of the compile-time macros `env!`, `option_env!`, `include!`,
+`include_str!`, `include_bytes!`, `concat!` and `stringify!`, which name variables and files or build other literals;
+values with no letter; values with whitespace in them; attributes and `extern "C"`; files whose opening comment has a
+line starting `@generated`; and test code: `tests/`, `benches/`, `examples/`, and anything under `#[test]` or
+`#[cfg(test)]`.
 
 Labels aren't counted either: a literal passed straight to a parameter of the package's own functions that only reaches
 a message, like `check("JSON", token)` where `check` only puts it in an `Err`. A function matches a call by name and
@@ -85,9 +92,15 @@ for every package that doesn't set its own. `sync` keeps the keys when it rewrit
 magic-strings = "warn"              # values passed as arguments: "deny" (default), "warn" or "allow"
 magic-strings-elsewhere = "warn"    # the most a value that is never an argument can be: "allow" (default), "warn" or "deny"
 magic-strings-whitespace = true     # also check values with whitespace in them (default false)
+magic-strings-proximity = 0         # lines a value's literals can span and be read together: 0 (default) is one line; -1 one file, -2 one directory, -3 the package
 ```
 
 `magic-strings = "allow"` turns the check off for the package; `magic-strings-elsewhere = "warn"` or `"deny"` also
 reports values that are never an argument.
 Values with whitespace in them (a space, a tab, a newline) are skipped unless `magic-strings-whitespace = true`: keys,
 headers and flags have none, so such a value is almost always text for people.
+
+`magic-strings-proximity` says how close a value's literals must all be to be read together, and so not reported, however
+many are arguments: a number of lines (`0`, the default, is one line; `3` is within three lines of each other, in one
+file), `-1` one file, `-2` one directory (a module and its submodules), or `-3` the whole package, which reports nothing. A
+constant among them is never close: a constant plus a literal should use the constant.
