@@ -28,7 +28,7 @@ not yours. `#[rustfmt::skip]` on an item is the only way to keep a layout by han
 ## `cargo black`
 
 ```sh
-cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.2.2   # or: --path ~/github/rust/black-rust
+cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.2.3   # or: --path ~/github/rust/black-rust
 ```
 
 | Command | What it does |
@@ -60,10 +60,12 @@ Only identical values match: `"orderId"` matches `"orderId"` and nothing else, n
 | A repeated value… | Is |
 |---|---|
 | passed as an argument at least once: `get("id")`, `.args(["--all"])`, `vec!["a"]`, `info!(target: "x", ...)` | an error |
-| passed as an argument once, every other use in other files or in that same function | a warning: most likely another concept that shares the spelling, such as one flag in two commands' parsers |
+| passed as an argument once, every other use in other files or in that same function, and no constant among them | a warning: most likely another concept that shares the spelling, such as one flag in two commands' parsers |
+| in a `const` or `static` and also written as a literal that is passed as an argument | an error, wherever the two are: the name exists, so use it |
 | only ever in one function, with at most one of its literals an argument (`strip_prefix("--x=")` beside a `"--x=" =>` arm) | not reported: read together, changed together. Two arguments in one function (declaring a flag and looking it up) are still an error |
 | all within `magic-strings-proximity` of each other, with no constant among them: in one statement, by default (`_ if arg.starts_with("--author") => value("--author")`) | not reported: read together, however many are arguments |
-| never an argument: `let`, `return`, `==`, match arms | not reported, unless `magic-strings-elsewhere` asks |
+| never an argument, in three or more functions: the same `==` or match arm written again (`"true" \| "yes" \| "on"` in four parsers) | a warning |
+| never an argument, in fewer: `let`, `return`, `==`, match arms | not reported, unless `magic-strings-elsewhere` asks |
 | only ever in `const`s and `static`s | not reported |
 
 Rust specifics: a literal is an argument when it is passed straight to a call, or inside `&`, `( )`, `[ ]`, a tuple
@@ -83,8 +85,10 @@ line starting `@generated`; and test code: `tests/`, `benches/`, `examples/`, an
 
 Labels aren't counted either: a literal passed straight to a parameter of the package's own functions that only reaches
 a message, like `check("JSON", token)` where `check` only puts it in an `Err`. A function matches a call by name and
-number of arguments (`Type::f` by its type too); a parameter that is used any other way, or passed to a function that
-isn't known to take a message, is a value.
+number of arguments, and only a call that can reach the package's own code: `f(..)`, `Type::f(..)`, `Self::f(..)`, a
+path through `crate`, `self`, `super` or one of the package's modules, or `self.f(..)`. `fs::read(..)` and
+`v.push(..)` never match, whatever the package calls its own functions. A parameter that is used any other way, or
+passed to a function that isn't known to take a message, is a value.
 
 A package changes these in its `Cargo.toml`, a workspace's root sets them in `[workspace.metadata.black]` for every
 package that doesn't set its own, and a module's table sets them for part of a package. `sync` keeps them all.
@@ -125,4 +129,5 @@ workspace. A value whose literals are in modules with different settings takes t
 narrowest proximity among them, and a module set to `"allow"` isn't counted at all.
 
 Each finding lists first the places that make it its level: for a value passed as an argument, its arguments and the
-other uses in their files. Uses in files with no argument follow on one line, by file.
+other uses in their files. Uses in files with no argument follow on one line, by file. Errors are always listed. Values that only warn
+are counted on one line, so the build output stays short; `cargo black check --warnings` lists them too.

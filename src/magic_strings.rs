@@ -315,14 +315,17 @@ fn finding(places: Vec<Place>) -> Option<Finding> {
 	let proximity = places.iter().map(|p| p.settings.proximity).min()?;
 	// Literals this close, however many are arguments, are read together: `starts_with("--x")` and `value("--x")` in one
 	// match arm. Not with a constant among them, though: a constant plus a literal should use the constant.
-	let close = places.iter().all(|p| p.kind != Kind::Definition) && proximity.holds(&places);
-	if places.len() < 2 || places.iter().all(|p| p.kind == Kind::Definition) || one_scope || close {
+	// A constant among them, though, is never close: a constant plus a literal should use the constant.
+	let defined = places.iter().any(|p| p.kind == Kind::Definition);
+	let close = !defined && proximity.holds(&places);
+	if places.len() < 2 || places.iter().all(|p| p.kind == Kind::Definition) || (one_scope && !defined) || close {
 		return None;
 	}
 	let mut arguments = places.iter().filter(|p| p.kind == Kind::Argument);
 	let first = arguments.next();
 	let lone_argument = match (first, arguments.next()) {
-		(Some(argument), None) => places.iter().all(|p| p.scope == argument.scope || p.file != argument.file),
+		// Never with a constant among them: the name exists, so the literal is wrong wherever it is.
+		(Some(argument), None) if !defined => places.iter().all(|p| p.scope == argument.scope || p.file != argument.file),
 		_ => false,
 	};
 	let as_argument = first.is_some();
@@ -331,10 +334,21 @@ fn finding(places: Vec<Place>) -> Option<Finding> {
 		// A lone argument, likely another concept sharing the spelling, is at most a warning.
 		(true, true) => as_argument_level.min(Level::Warn),
 		(true, false) => as_argument_level,
-		(false, _) => places.iter().map(|p| p.settings.elsewhere).max()?,
+		(false, _) => {
+			let elsewhere = places.iter().map(|p| p.settings.elsewhere).max()?;
+			// Compared or matched in several functions, a value is the same check written again each time (four parsers
+			// of "true" | "yes" | "on"): at least a warning, though it is never passed on.
+			let mut functions: Vec<usize> = places.iter().filter(|p| p.kind != Kind::Definition).map(|p| p.scope).collect();
+			functions.sort_unstable();
+			functions.dedup();
+			if functions.len() >= SPREAD { elsewhere.max(as_argument_level.min(Level::Warn)) } else { elsewhere }
+		}
 	};
 	(level != Level::Allow).then_some(Finding { places, level, as_argument })
 }
+
+/// How many functions a value never passed as an argument must be in to be the same check written again.
+const SPREAD: usize = 3;
 
 /// Number sources, so each scope and unit gets its own number across the package.
 #[derive(Default)]
@@ -685,7 +699,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 			return;
 		}
 		for (i, arg) in call.args.iter().enumerate() {
-			if !(is_str_literal(arg) && self.messages.method(&call.method, call.args.len(), i)) {
+			if !(is_str_literal(arg) && self.messages.method(&call.receiver, &call.method, call.args.len(), i)) {
 				self.argument(arg);
 			}
 		}
@@ -1018,5 +1032,35 @@ mod tests {
 		assert_eq!(module("pkg/src/cli/mod.rs"), "cli");
 		assert_eq!(module("pkg/src/cli/log.rs"), "cli::log");
 		assert_eq!(module("pkg/src/bin/tool.rs"), "");
+	}
+	#[test]
+	fn the_same_comparison_in_three_functions_is_a_warning() {
+		let parsers = "fn a(v: &str) -> bool { matches!(v, \"yes\" | \"on\") }\nfn b(v: &str) -> bool { v == \"yes\" }\nfn c(v: &str) -> bool { match v { \"yes\" => true, _ => false } }";
+		assert_eq!(check(&[("src/a.rs", parsers)])["yes"].level, Level::Warn);
+		// In two functions it is still nobody's business but theirs.
+		assert!(!check(&[("src/a.rs", "fn a(v: &str) -> bool { v == \"yes\" }\nfn b(v: &str) -> bool { v == \"yes\" }")]).contains_key("yes"));
+	}
+
+	#[test]
+	fn a_literal_beside_a_constant_keeps_the_full_level() {
+		// One argument, its only other use in another file: a warning, but not when that use is the constant.
+		let files = [("src/refs.rs", "pub const HEAD: &str = \"HEAD\";"), ("src/log.rs", "fn a() { resolve(\"HEAD\"); }")];
+		assert_eq!(check(&files)["HEAD"].level, Level::Deny);
+	}
+
+	#[test]
+	fn a_label_needs_a_call_that_reaches_the_package() {
+		let note = "struct S;\nimpl S { fn note(&self, what: &str) { println!(\"{what}\"); } }\nfn read(what: &str) { println!(\"{what}\"); }\n";
+		// On self, or by its own path: labels.
+		let ours = format!(
+			"{note}impl S {{ fn a(&self) {{ self.note(\"JSON\"); }}\nfn b(&self) {{ self.note(\"JSON\"); }} }}\nfn c() {{ read(\"x.toml\"); }}\nfn d() {{ crate::read(\"x.toml\"); }}"
+		);
+		assert!(check(&[("src/a.rs", &ours)]).is_empty());
+		// On anything else, or through another crate's path, no telling: values.
+		let theirs = format!(
+			"{note}fn a(v: &mut Vec<&str>) {{ v.note(\"JSON\"); }}\nfn b(v: &mut Vec<&str>) {{ v.note(\"JSON\"); }}\nfn c() {{ fs::read(\"x.toml\"); }}\nfn d() {{ fs::read(\"x.toml\"); }}"
+		);
+		let found = check(&[("src/a.rs", &theirs)]);
+		assert!(found.contains_key("JSON") && found.contains_key("x.toml"));
 	}
 }

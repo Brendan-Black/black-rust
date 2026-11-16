@@ -24,7 +24,11 @@ pub struct Callee {
 /// For each function the package defines, whether each of its arguments is a message. Functions that calls can't tell
 /// apart (same name, same number of arguments) share one entry, which says message only where every one of them does.
 #[derive(Default, PartialEq)]
-pub struct MessageParams(HashMap<Callee, Vec<bool>>);
+pub struct MessageParams {
+	params: HashMap<Callee, Vec<bool>>,
+	/// The package's module names (every `mod x`), so `x::f(..)` is known to be the package's own and `fs::read(..)` isn't.
+	modules: HashSet<String>,
+}
 
 impl MessageParams {
 	/// Works it out for these files: no parameter is a message at first, then each pass marks the ones used only in what
@@ -32,12 +36,12 @@ impl MessageParams {
 	/// keeps a function from vouching for itself: `fn join(&self, name) { self.path.join(name) }` calls a `join`, but
 	/// not one known to take a message.
 	pub fn of(files: &[&syn::File]) -> Self {
-		let mut collector = Collector { functions: Vec::new(), owner: None };
+		let mut collector = Collector { functions: Vec::new(), owner: None, modules: HashSet::new() };
 		files.iter().for_each(|file| collector.visit_file(file));
-		let functions = collector.functions;
-		let mut params = combine(&functions, |f| vec![false; f.params.len()]);
+		let (functions, modules) = (collector.functions, collector.modules);
+		let mut params = combine(&functions, &modules, |f| vec![false; f.params.len()]);
 		loop {
-			let next = combine(&functions, |f| {
+			let next = combine(&functions, &modules, |f| {
 				let mut uses = Uses {
 					names: f.params.iter().flatten().map(String::as_str).collect(),
 					params: &params,
@@ -57,24 +61,29 @@ impl MessageParams {
 	}
 
 	/// Whether the `index`th argument of a call to `f(..)` or `path::f(..)` is a message. `owner` is the type `Self`
-	/// stands for where the call is.
+	/// stands for where the call is. Only a call that can reach the package's own code counts: `f(..)`, `Type::f(..)`,
+	/// `Self::f(..)`, or a path through `crate`, `self`, `super` or one of the package's modules. `fs::read(..)` names
+	/// no function of the package's, however many it has called `read`.
 	pub fn call(&self, path: &syn::Path, arity: usize, index: usize, owner: Option<&str>) -> bool {
-		let mut segments = path.segments.iter().rev();
-		let Some(name) = segments.next().map(|s| s.ident.to_string()) else { return false };
-		let qualifier = segments.next().map(|s| s.ident.to_string());
-		let qualifier = match qualifier.as_deref() {
-			Some(SELF_TYPE) => owner.map(str::to_owned),
-			_ => qualifier,
+		let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+		let Some((name, before)) = segments.split_last() else { return false };
+		let callee = match before {
+			[] => Callee { owner: None, name: name.clone(), arity, method: false },
+			[.., qualifier] if qualifier == SELF_TYPE || qualifier.starts_with(char::is_uppercase) => {
+				let owner = if qualifier == SELF_TYPE { owner.map(str::to_owned) } else { Some(qualifier.clone()) };
+				Callee { owner, name: name.clone(), arity, method: false }
+			}
+			[first, ..] if PATH_ROOTS.contains(&first.as_str()) || self.modules.contains(first) => Callee { owner: None, name: name.clone(), arity, method: false },
+			_ => return false,
 		};
-		// `Type::f` names an associated function; `module::f` and `f` a free one.
-		let associated = qualifier.map(|owner| Callee { owner: Some(owner), name: name.clone(), arity, method: false });
-		let free = Callee { owner: None, name, arity, method: false };
-		associated.and_then(|c| self.0.get(&c)).or_else(|| self.0.get(&free)).is_some_and(|flags| flags[index])
+		self.params.get(&callee).is_some_and(|flags| flags[index])
 	}
 
-	/// Whether the `index`th argument of a call to `.name(..)` is a message.
-	pub fn method(&self, name: &syn::Ident, arity: usize, index: usize) -> bool {
-		self.0.get(&Callee { owner: None, name: name.to_string(), arity, method: true }).is_some_and(|flags| flags[index])
+	/// Whether the `index`th argument of a call to `receiver.name(..)` is a message. Only on `self`: without types, any
+	/// other receiver may be a standard type's, whose `push` or `insert` is not the package's.
+	pub fn method(&self, receiver: &syn::Expr, name: &syn::Ident, arity: usize, index: usize) -> bool {
+		let on_self = matches!(receiver, syn::Expr::Path(p) if p.path.is_ident(SELF_VALUE));
+		on_self && self.params.get(&Callee { owner: None, name: name.to_string(), arity, method: true }).is_some_and(|flags| flags[index])
 	}
 }
 
@@ -94,10 +103,15 @@ fn captures(format: &str) -> Vec<String> {
 		.collect()
 }
 
+/// The path roots that lead into the package itself.
+const PATH_ROOTS: [&str; 3] = ["crate", "self", "super"];
+/// What the receiver is called in a method.
+const SELF_VALUE: &str = "self";
+
 /// What `Self` is called in a path.
 const SELF_TYPE: &str = "Self";
 
-fn combine(functions: &[Function], each: impl Fn(&Function) -> Vec<bool>) -> MessageParams {
+fn combine(functions: &[Function], modules: &HashSet<String>, each: impl Fn(&Function) -> Vec<bool>) -> MessageParams {
 	let mut out: HashMap<Callee, Vec<bool>> = HashMap::new();
 	for f in functions {
 		let flags = each(f);
@@ -108,7 +122,7 @@ fn combine(functions: &[Function], each: impl Fn(&Function) -> Vec<bool>) -> Mes
 			}
 		}
 	}
-	MessageParams(out)
+	MessageParams { params: out, modules: modules.clone() }
 }
 
 struct Function<'ast> {
@@ -131,6 +145,8 @@ struct Collector<'ast> {
 	functions: Vec<Function<'ast>>,
 	/// The type of the `impl` being visited.
 	owner: Option<String>,
+	/// Every `mod x` the package declares.
+	modules: HashSet<String>,
 }
 
 impl<'ast> Collector<'ast> {
@@ -156,6 +172,9 @@ impl<'ast> Collector<'ast> {
 impl<'ast> Visit<'ast> for Collector<'ast> {
 	fn visit_item(&mut self, item: &'ast syn::Item) {
 		if !is_test(item_attrs(item)) {
+			if let syn::Item::Mod(module) = item {
+				self.modules.insert(module.ident.to_string());
+			}
 			visit::visit_item(self, item);
 		}
 	}
@@ -265,7 +284,7 @@ impl<'ast> Visit<'ast> for Uses<'_> {
 		self.visit_expr(&call.receiver);
 		let all = MESSAGE_METHODS.contains(&call.method.to_string().as_str());
 		for (i, arg) in call.args.iter().enumerate() {
-			let message = all || self.params.method(&call.method, call.args.len(), i);
+			let message = all || self.params.method(&call.receiver, &call.method, call.args.len(), i);
 			self.argument(arg, message);
 		}
 	}

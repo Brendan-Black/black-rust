@@ -28,14 +28,24 @@ const USAGE: &str = "usage: cargo black <sync|check>
   sync   write the standards into this project: rustfmt.toml, clippy.toml, .editorconfig, the lints in Cargo.toml,
          and .vscode/settings.json if there is none
   check  fail if any of those differ from the standards, if cargo fmt would change anything, if cargo clippy warns,
-         or if a string literal's value appears twice in a package's non-test code (magic-strings)";
+         or if a string literal's value appears twice in a package's non-test code (magic-strings)
+         --warnings  also list the magic strings that only warn, not just how many there are";
+/// The `check` flag that lists the magic strings that only warn.
+const WARNINGS_FLAG: &str = "--warnings";
 
 fn main() -> ExitCode {
 	// Cargo runs `cargo black x` as `cargo-black black x`.
 	let args: Vec<String> = std::env::args().skip(1).skip_while(|a| a == "black").collect();
 	let result = match args.first().map(String::as_str) {
 		Some("sync") => sync(),
-		Some("check") => check(),
+		Some("check") => match args.get(1).map(String::as_str) {
+			None => check(false),
+			Some(WARNINGS_FLAG) => check(true),
+			Some(_) => {
+				eprintln!("{USAGE}");
+				return ExitCode::from(2);
+			}
+		},
 		Some("--version" | "-V") => {
 			println!("cargo-black {VERSION}");
 			Ok(true)
@@ -99,7 +109,8 @@ fn sync() -> Result<bool, String> {
 	Ok(true)
 }
 
-fn check() -> Result<bool, String> {
+/// `list_warnings`: list the magic strings that only warn, not just count them.
+fn check(list_warnings: bool) -> Result<bool, String> {
 	let workspace = Workspace::find()?;
 	let mut ok = true;
 	if let Some(recorded) = workspace.recorded_version()?
@@ -120,7 +131,7 @@ fn check() -> Result<bool, String> {
 	let manifest = manifest.to_str().ok_or("the workspace path isn't UTF-8")?;
 	ok &= cargo(manifest, &["fmt", "--all", "--check"])?;
 	ok &= cargo(manifest, &["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])?;
-	ok &= check_magic_strings(&workspace)?;
+	ok &= check_magic_strings(&workspace, list_warnings)?;
 	Ok(ok)
 }
 
@@ -129,7 +140,8 @@ const ERROR_LABEL: &str = "error";
 
 /// Reports every value repeated in a package's string literals, as an error or a warning by the package's settings, and
 /// says whether there were no errors.
-fn check_magic_strings(workspace: &Workspace) -> Result<bool, String> {
+fn check_magic_strings(workspace: &Workspace, list_warnings: bool) -> Result<bool, String> {
+	let mut unlisted = 0;
 	use magic_strings::{Level, MODULES_TABLE, Policy};
 	let root = workspace.root_manifest()?;
 	let in_workspace = settings_in(item_at(&root, WORKSPACE_BLACK), &format!("[{WORKSPACE_BLACK}]"))?;
@@ -149,6 +161,12 @@ fn check_magic_strings(workspace: &Workspace) -> Result<bool, String> {
 		let policy = Policy::new(package, modules);
 		let dir = member.parent().ok_or("a package manifest has no directory")?;
 		for (value, finding) in magic_strings::findings(dir, &policy)? {
+			// Errors are always listed; warnings, which don't fail the build, only on request, so they aren't a wall of text
+			// nobody reads on every run.
+			if finding.level != Level::Deny && !list_warnings {
+				unlisted += 1;
+				continue;
+			}
 			let label = if finding.level == Level::Deny { ERROR_LABEL } else { WARNING_LABEL };
 			let arguments = finding.places.iter().filter(|p| p.kind == magic_strings::Kind::Argument).count();
 			eprintln!("{label}: magic string {value:?} appears {} times, {arguments} as an argument: name it (black values/magic-strings)", finding.places.len());
@@ -171,6 +189,9 @@ fn check_magic_strings(workspace: &Workspace) -> Result<bool, String> {
 			}
 			ok &= finding.level != Level::Deny;
 		}
+	}
+	if unlisted > 0 {
+		eprintln!("{WARNING_LABEL}: {unlisted} more magic string(s) that only warn; `cargo black check {WARNINGS_FLAG}` lists them");
 	}
 	Ok(ok)
 }
