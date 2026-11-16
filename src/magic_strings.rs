@@ -94,7 +94,7 @@ impl Proximity {
 	}
 
 	/// Whether these literals are all this close.
-	fn holds(self, places: &[Place]) -> bool {
+	fn holds(self, places: &[&Place]) -> bool {
 		let Some(first) = places.first() else { return false };
 		match self {
 			Self::Statement => places.iter().all(|p| p.unit == first.unit),
@@ -233,6 +233,11 @@ pub struct Place {
 	settings: Resolved,
 	/// For a definition, whether code outside its module can name it.
 	public: bool,
+	/// For a definition, whether its constant is a name for this string: its whole value is the literal.
+	named: bool,
+	/// The binary the file is the root of (`src/main.rs`, `src/bin/*.rs`, `build.rs`), each a crate of its own; none for
+	/// the library.
+	binary: Option<PathBuf>,
 }
 
 /// A value to report: where it appears, at which level, and whether any of those is an argument.
@@ -282,6 +287,7 @@ fn findings_in(package_dir: &Path, parsed: &[(PathBuf, syn::File)], policy: &Pol
 	let mut counters = Counters::default();
 	for (file, syntax) in parsed {
 		let module = module_of(package_dir, file);
+		let binary = is_binary_root(package_dir, file).then(|| file.clone());
 		let settings = policy.resolve(&module);
 		if settings.level == Level::Allow {
 			// Not checked, so not counted: like a Java package set to "ignore".
@@ -294,6 +300,9 @@ fn findings_in(package_dir: &Path, parsed: &[(PathBuf, syn::File)], policy: &Pol
 			seen: &mut seen,
 			in_definition: false,
 			public_definition: false,
+			named_definition: false,
+			binary,
+			nested: false,
 			messages: &messages,
 			owner: None,
 			scope: 0,
@@ -314,14 +323,16 @@ fn finding(places: Vec<Place>) -> Option<Finding> {
 	// One function's literals are exempt only with at most one argument among them: two (declaring a flag and looking it
 	// up, or writing a key and reading it) are the typo the rule is for.
 	let arguments_in_all = places.iter().filter(|p| p.kind == Kind::Argument).count();
-	let one_scope = places.iter().all(|p| p.scope == places[0].scope) && arguments_in_all <= 1;
+	// A constant the literals could name is always the full level: a constant plus a literal should use the constant.
+	// One they couldn't (a private one of another module) says nothing about them, so it plays no part in what follows.
+	let defined = usable_constant(&places);
+	let literals: Vec<&Place> = places.iter().filter(|p| p.kind != Kind::Definition).collect();
+	let one_scope = literals.iter().all(|p| p.scope == literals[0].scope) && arguments_in_all <= 1;
 	let proximity = places.iter().map(|p| p.settings.proximity).min()?;
 	// Literals this close, however many are arguments, are read together: `starts_with("--x")` and `value("--x")` in one
-	// match arm. Not with a constant among them, though: a constant plus a literal should use the constant.
-	// A constant among them, though, is never close: a constant plus a literal should use the constant.
-	let defined = places.iter().any(|p| p.kind == Kind::Definition);
-	let close = !defined && proximity.holds(&places);
-	if places.len() < 2 || places.iter().all(|p| p.kind == Kind::Definition) || (one_scope && !defined) || close {
+	// match arm.
+	let close = !defined && proximity.holds(&literals);
+	if places.len() < 2 || literals.is_empty() || (one_scope && !defined) || close {
 		return None;
 	}
 	let mut arguments = places.iter().filter(|p| p.kind == Kind::Argument);
@@ -355,7 +366,27 @@ fn finding(places: Vec<Place>) -> Option<Finding> {
 /// use, so it says nothing about whether the two are one concept.
 fn usable_constant(places: &[Place]) -> bool {
 	let arguments: Vec<&Place> = places.iter().filter(|p| p.kind == Kind::Argument).collect();
-	places.iter().filter(|d| d.kind == Kind::Definition).any(|d| d.public || arguments.iter().any(|a| a.module.starts_with(&d.module)))
+	places.iter().filter(|d| d.kind == Kind::Definition).any(|d| arguments.iter().any(|a| can_name(d, a)))
+}
+
+/// Whether code where `a` is can name the constant `d`. In one crate: when it is public, or `a` is in its module or one
+/// inside it. A binary can name the library's public constants; the library can name none of a binary's.
+fn can_name(d: &Place, a: &Place) -> bool {
+	if !d.named {
+		return false;
+	}
+	match (&d.binary, &a.binary) {
+		(None, None) => d.public || a.module.starts_with(&d.module),
+		(Some(x), Some(y)) if x == y => d.public || a.module.starts_with(&d.module),
+		(None, Some(_)) => d.public,
+		_ => false,
+	}
+}
+
+/// Whether a file is a binary's root, and so a crate of its own: `src/main.rs`, `src/bin/*.rs` or `build.rs`.
+fn is_binary_root(package_dir: &Path, file: &Path) -> bool {
+	let relative = file.strip_prefix(package_dir).unwrap_or(file);
+	relative == Path::new("src/main.rs") || relative == Path::new(BUILD_SCRIPT) || relative.parent() == Some(Path::new("src/bin"))
 }
 
 /// Whether an item can be named outside its module.
@@ -374,7 +405,9 @@ struct Counters {
 }
 
 /// Files that are modules' roots, so their `mod x;` is a sibling `x.rs` rather than one in a directory named after them.
-const ROOT_FILES: [&str; 4] = ["lib.rs", "main.rs", "mod.rs", "build.rs"];
+const ROOT_FILES: [&str; 4] = ["lib.rs", "main.rs", "mod.rs", BUILD_SCRIPT];
+/// A package's build script, at its root: a binary of its own.
+const BUILD_SCRIPT: &str = "build.rs";
 /// The directory of binaries, each a crate root of its own.
 const BIN_DIR: &str = "bin";
 
@@ -552,6 +585,12 @@ struct Finder<'a> {
 	in_definition: bool,
 	/// Whether that constant can be named outside its module (`pub`, `pub(crate)` and the like).
 	public_definition: bool,
+	/// Whether that constant's whole value is one string literal: a name for that string.
+	named_definition: bool,
+	/// The binary the file is the root of, if it is one.
+	binary: Option<PathBuf>,
+	/// Inside a statement that isn't itself an `if` or a `match`: a branch there is part of that statement, not a unit.
+	nested: bool,
 	/// Which parameters of the package's functions are messages.
 	messages: &'a MessageParams,
 	/// The type of the `impl` being visited, which `Self` stands for.
@@ -570,9 +609,9 @@ impl Finder<'_> {
 	/// Visit an item in a scope, and a unit, of its own.
 	fn in_scope(&mut self, visit: impl FnOnce(&mut Self)) {
 		self.counters.scopes += 1;
-		let outer = std::mem::replace(&mut self.scope, self.counters.scopes);
+		let outer = (std::mem::replace(&mut self.scope, self.counters.scopes), std::mem::take(&mut self.nested));
 		self.in_unit(false, visit);
-		self.scope = outer;
+		(self.scope, self.nested) = outer;
 	}
 
 	/// Visit a statement, or a branch, in a unit of its own. A branch (`join` true) shares it with its body's first statement.
@@ -599,6 +638,8 @@ impl Finder<'_> {
 			module: self.module.clone(),
 			settings: self.settings,
 			public: self.in_definition && self.public_definition,
+			named: self.in_definition && self.named_definition,
+			binary: self.binary.clone(),
 		};
 		self.seen.entry(value).or_default().push(place);
 	}
@@ -617,12 +658,13 @@ impl Finder<'_> {
 		}
 	}
 
-	/// Visit a constant or static, `public` if code outside its module can name it.
-	fn in_definition(&mut self, public: bool, visit: impl FnOnce(&mut Self)) {
-		let outer = (self.in_definition, self.public_definition);
-		(self.in_definition, self.public_definition) = (true, public);
+	/// Visit a constant or static: `public` if code outside its module can name it, `named` if its whole value is one
+	/// string literal, so it is a name for that string (an entry in a table isn't).
+	fn in_definition(&mut self, public: bool, named: bool, visit: impl FnOnce(&mut Self)) {
+		let outer = (self.in_definition, self.public_definition, self.named_definition);
+		(self.in_definition, self.public_definition, self.named_definition) = (true, public, named);
 		visit(self);
-		(self.in_definition, self.public_definition) = outer;
+		(self.in_definition, self.public_definition, self.named_definition) = outer;
 	}
 
 	/// Every string literal among a macro's tokens, as `kind`.
@@ -752,18 +794,39 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 	// `_ if a.starts_with("--x") => value("--x")` is one however the formatter breaks its lines, but two statements in
 	// one arm (declaring a flag, then looking it up) are two.
 	fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
-		if std::mem::take(&mut self.join_next) {
+		// An `if` or `match` that is the statement splits into its branches; one inside another statement (`let name = if
+		// get("Name").is_empty() { .. } else { get("Name") };`) is part of that one statement.
+		if self.nested {
+			// A block inside that other statement (an `if`'s, a closure's) is still part of it.
 			visit::visit_stmt(self, stmt);
+			return;
+		}
+		let control = matches!(stmt, syn::Stmt::Expr(syn::Expr::If(_) | syn::Expr::Match(_), _));
+		let visit = |f: &mut Self| {
+			let outer = std::mem::replace(&mut f.nested, !control);
+			visit::visit_stmt(f, stmt);
+			f.nested = outer;
+		};
+		if std::mem::take(&mut self.join_next) {
+			visit(self);
 		} else {
-			self.in_unit(false, |f| visit::visit_stmt(f, stmt));
+			self.in_unit(false, visit);
 		}
 	}
 
 	fn visit_arm(&mut self, arm: &'ast syn::Arm) {
-		self.in_unit(true, |f| visit::visit_arm(f, arm));
+		if self.nested {
+			visit::visit_arm(self, arm);
+		} else {
+			self.in_unit(true, |f| visit::visit_arm(f, arm));
+		}
 	}
 
 	fn visit_expr_if(&mut self, e: &'ast syn::ExprIf) {
+		if self.nested {
+			visit::visit_expr_if(self, e);
+			return;
+		}
 		self.in_unit(true, |f| {
 			f.visit_expr(&e.cond);
 			f.visit_block(&e.then_branch);
@@ -781,19 +844,19 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 	fn visit_abi(&mut self, _: &'ast syn::Abi) {}
 
 	fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
-		self.in_definition(is_public(&item.vis), |f| visit::visit_item_const(f, item));
+		self.in_definition(is_public(&item.vis), is_str_literal(&item.expr), |f| visit::visit_item_const(f, item));
 	}
 
 	fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
-		self.in_definition(is_public(&item.vis), |f| visit::visit_item_static(f, item));
+		self.in_definition(is_public(&item.vis), is_str_literal(&item.expr), |f| visit::visit_item_static(f, item));
 	}
 
 	fn visit_impl_item_const(&mut self, item: &'ast syn::ImplItemConst) {
-		self.in_definition(is_public(&item.vis), |f| visit::visit_impl_item_const(f, item));
+		self.in_definition(is_public(&item.vis), is_str_literal(&item.expr), |f| visit::visit_impl_item_const(f, item));
 	}
 
 	fn visit_trait_item_const(&mut self, item: &'ast syn::TraitItemConst) {
-		self.in_definition(true, |f| visit::visit_trait_item_const(f, item));
+		self.in_definition(true, item.default.as_ref().is_some_and(|(_, e)| is_str_literal(e)), |f| visit::visit_trait_item_const(f, item));
 	}
 
 	fn visit_item(&mut self, item: &'ast syn::Item) {
@@ -1066,9 +1129,9 @@ mod tests {
 		// One argument, its only other use in another file: a warning, but not when that use is the constant.
 		let files = [("src/refs.rs", "pub const HEAD: &str = \"HEAD\";"), ("src/log.rs", "fn a() { resolve(\"HEAD\"); }")];
 		assert_eq!(check(&files)["HEAD"].level, Level::Deny);
-		// A private constant of another module is no name the literal could use: just a lone argument.
+		// A private constant of another module is no name the literal could use: the literal is used once.
 		let private = [("src/speech.rs", "const ESPEAK_WAV: &str = \"-w\";"), ("src/awake.rs", "fn a() { run(\"-w\"); }")];
-		assert_eq!(check(&private)["-w"].level, Level::Warn);
+		assert!(!check(&private).contains_key("-w"), "caffeinate's -w is used once");
 		// In its own module, or one inside it, it is.
 		let inside = [("src/speech.rs", "const WAV: &str = \"-w\";"), ("src/speech/espeak.rs", "fn a() { run(\"-w\"); }")];
 		assert_eq!(check(&inside)["-w"].level, Level::Deny);
@@ -1088,5 +1151,25 @@ mod tests {
 		);
 		let found = check(&[("src/a.rs", &theirs)]);
 		assert!(found.contains_key("JSON") && found.contains_key("x.toml"));
+	}
+	#[test]
+	fn a_binarys_constant_is_no_name_the_library_can_use() {
+		// main.rs is a crate of its own: the library can't name its flags.
+		let files = [("src/main.rs", "mod flags { pub const DNS: &str = \"dns\"; }"), ("src/events.rs", "fn a() { write(\"dns\"); }")];
+		assert!(!check(&files).contains_key("dns"), "the library's one literal is just a value used once");
+		// The binary can name the library's public constants.
+		let files = [("src/refs.rs", "pub const HEAD: &str = \"HEAD\";"), ("src/main.rs", "fn a() { resolve(\"HEAD\"); }")];
+		assert_eq!(check(&files)["HEAD"].level, Level::Deny);
+	}
+
+	#[test]
+	fn a_branch_inside_another_statement_is_part_of_it() {
+		let let_if = "fn a(get: fn(&str) -> &str) {\nlet name = if get(\"Name\").is_empty() {\n\"(unnamed)\"\n} else {\nget(\"Name\")\n};\n}";
+		assert!(check(&[("src/a.rs", let_if)]).is_empty());
+	}
+	#[test]
+	fn an_entry_in_a_table_is_no_name_for_the_string() {
+		let files = [("src/etw.rs", "pub const NAMES: &[(&str, u32)] = &[(\"dns\", 1)];"), ("src/traffic.rs", "fn a() { write(\"dns\"); }")];
+		assert!(!check(&files).contains_key("dns"));
 	}
 }

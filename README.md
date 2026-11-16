@@ -28,7 +28,7 @@ not yours. `#[rustfmt::skip]` on an item is the only way to keep a layout by han
 ## `cargo black`
 
 ```sh
-cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.2.4   # or: --path ~/github/rust/black-rust
+cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.2.5   # or: --path ~/github/rust/black-rust
 ```
 
 | Command | What it does |
@@ -61,7 +61,7 @@ Only identical values match: `"orderId"` matches `"orderId"` and nothing else, n
 |---|---|
 | passed as an argument at least once: `get("id")`, `.args(["--all"])`, `vec!["a"]`, `info!(target: "x", ...)` | an error |
 | passed as an argument once, every other use in other files or in that same function, and no constant among them | a warning: most likely another concept that shares the spelling, such as one flag in two commands' parsers |
-| in a `const` or `static` and also written as a literal passed as an argument where that constant can be named (it is `pub`, or the literal is in its module or one inside it) | an error: the name exists, so use it |
+| a `const` or `static` whose whole value is the string, and a literal of it passed as an argument where that constant can be named (it is `pub`, or the literal is in its module or one inside it; a binary's constants are its own) | an error: the name exists, so use it |
 | only ever in one function, with at most one of its literals an argument (`strip_prefix("--x=")` beside a `"--x=" =>` arm) | not reported: read together, changed together. Two arguments in one function (declaring a flag and looking it up) are still an error |
 | all within `magic-strings-proximity` of each other, with no constant among them: in one statement, by default (`_ if arg.starts_with("--author") => value("--author")`) | not reported: read together, however many are arguments |
 | never an argument, in three or more functions: the same `==` or match arm written again (`"true" \| "yes" \| "on"` in four parsers) | a warning |
@@ -115,7 +115,7 @@ many are arguments. A constant among them is never close: a constant plus a lite
 
 | Proximity | Literals are close when they are all in |
 |---|---|
-| `"statement"` (default) | one statement, or one branch's head and what it leads to: a match arm's pattern and guard with its expression or its block's first statement, an `if`'s condition with its block's first statement. Line breaks don't matter |
+| `"statement"` (default) | one statement, or one branch's head and what it leads to: a match arm's pattern and guard with its expression or its block's first statement, an `if`'s condition with its block's first statement. Line breaks don't matter. An `if` or `match` inside another statement, such as a `let`, is part of that statement |
 | `"function"` | one function, or one item outside a function |
 | `"file"` | one file |
 | `"module"` | one module below the crate root and the modules inside it (`cli`, `cli::log`), or the root module's own files |
