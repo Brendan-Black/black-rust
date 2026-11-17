@@ -169,7 +169,10 @@ fn check_magic_strings(workspace: &Workspace, list_warnings: bool) -> Result<boo
 			}
 			let label = if finding.level == Level::Deny { ERROR_LABEL } else { WARNING_LABEL };
 			let arguments = finding.places.iter().filter(|p| p.kind == magic_strings::Kind::Argument).count();
-			eprintln!("{label}: magic string {value:?} appears {} times, {arguments} as an argument: name it (black values/magic-strings)", finding.places.len());
+			eprintln!(
+				"{label}: magic string {value:?} appears {} times, {arguments} as an argument: name it (black conventions/values/magic-strings)",
+				finding.places.len()
+			);
 			let relative = |file: &'_ Path| file.strip_prefix(&workspace.root).unwrap_or(file).display().to_string();
 			let (shown, rest) = finding.triggering();
 			for place in shown {

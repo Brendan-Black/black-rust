@@ -11,8 +11,9 @@ a Rust project, `cargo black` to install and check it, and the guide's Rust spec
   as). Lines up to 160. Short things stay on one line up to the full width (`use_small_heuristics = "Max"`), the
   nearest rustfmt gets to the Java profile's one-line blocks.
 - **[`lints.toml`](standards/lints.toml).** rustc's and Clippy's defaults, which `check` fails on, plus the guide's
-  rules a lint can hold. `unused_must_use` is `forbid`: [don't swallow errors](https://github.com/Brendan-Black/black/blob/master/errors/dont-swallow.md)
-  is a correctness rule, and `forbid` is the level no `#[allow]` can lift.
+  rules a lint can hold. `unused_must_use` is `forbid`: [don't swallow
+  errors](https://github.com/Brendan-Black/black/blob/master/correctness/errors/dont-swallow.md) is a correctness rule,
+  and `forbid` is the level no `#[allow]` can lift.
 - **[`clippy.toml`](standards/clippy.toml).** Tests may `unwrap()`.
 - **[`editorconfig`](standards/editorconfig)** and **[`vscode-settings.json`](standards/vscode-settings.json).** The
   editor's side: tabs 2 wide, rust-analyzer formatting, and rust-analyzer checking with Clippy, so the editor warns
@@ -28,7 +29,7 @@ not yours. `#[rustfmt::skip]` on an item is the only way to keep a layout by han
 ## `cargo black`
 
 ```sh
-cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.2.5   # or: --path ~/github/rust/black-rust
+cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.2.6   # or: --path ~/github/rust/black-rust
 ```
 
 | Command | What it does |
@@ -51,7 +52,7 @@ same however often it runs; that's what `check` compares against.
 
 `check` reports every string value that appears in two literals of a package's non-test code, and every place it
 appears, by the definition in the guide's
-[name magic strings](https://github.com/Brendan-Black/black/blob/master/values/magic-strings.md#what-the-build-checks).
+[repeated-literal check](https://github.com/Brendan-Black/black/blob/master/conventions/values/magic-strings-check.md).
 Name it, with a `const` or an enum, and the literal appears once. Each package is checked on its own.
 
 Only identical values match: `"orderId"` matches `"orderId"` and nothing else, not `"orderid"` or
@@ -110,8 +111,8 @@ reports values that are never an argument.
 Values with whitespace in them (a space, a tab, a newline) are skipped unless `magic-strings-whitespace = true`: keys,
 headers and flags have none, so such a value is almost always text for people.
 
-`magic-strings-proximity` says how close a value's literals must all be to be read together, and so not reported, however
-many are arguments. A constant among them is never close: a constant plus a literal should use the constant.
+`magic-strings-proximity` says how close a value's literals must all be to be read together, and so not reported,
+however many are arguments. A constant among them is never close: a constant plus a literal should use the constant.
 
 | Proximity | Literals are close when they are all in |
 |---|---|
@@ -121,13 +122,13 @@ many are arguments. A constant among them is never close: a constant plus a lite
 | `"module"` | one module below the crate root and the modules inside it (`cli`, `cli::log`), or the root module's own files |
 | `"crate"` | the package: nothing is reported |
 
-A module's table, `[package.metadata.black.modules."cli::log"]` (with or without `crate::`), takes the same four settings
-for that module and the modules inside it. A file's module comes from its path: `src/cli/log.rs` and
+A module's table, `[package.metadata.black.modules."cli::log"]` (with or without `crate::`), takes the same four
+settings for that module and the modules inside it. A file's module comes from its path: `src/cli/log.rs` and
 `src/cli/log/mod.rs` are `cli::log`; `src/lib.rs`, `src/main.rs`, `src/bin/*.rs` and `build.rs` are the crate root. The
 longest matching table decides each setting it sets; the rest come from the next module up, then the package, then the
-workspace. A value whose literals are in modules with different settings takes the most severe level and the
-narrowest proximity among them, and a module set to `"allow"` isn't counted at all.
+workspace. A value whose literals are in modules with different settings takes the most severe level and the narrowest
+proximity among them, and a module set to `"allow"` isn't counted at all.
 
 Each finding lists first the places that make it its level: for a value passed as an argument, its arguments and the
-other uses in their files. Uses in files with no argument follow on one line, by file. Errors are always listed. Values that only warn
-are counted on one line, so the build output stays short; `cargo black check --warnings` lists them too.
+other uses in their files. Uses in files with no argument follow on one line, by file. Errors are always listed. Values
+that only warn are counted on one line, so the build output stays short; `cargo black check --warnings` lists them too.

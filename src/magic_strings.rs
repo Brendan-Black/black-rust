@@ -1,4 +1,4 @@
-//! The magic-string check (black values/magic-strings): a string value that appears in more than one literal of a
+//! The magic-string check (black conventions/values/magic-strings): a string value that appears in more than one literal of a
 //! package's non-test code should be named, so `check` reports every such value.
 //!
 //! Values match only when they are identical: same characters, same case, nothing trimmed. "orderId" matches
