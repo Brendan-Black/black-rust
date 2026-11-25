@@ -13,7 +13,7 @@ pub mod headers {
 ## The check, in Rust
 
 How the [repeated-literal
-check](https://github.com/Brendan-Black/black/blob/master/conventions/values/magic-strings-check.md)'s terms map to
+check](https://github.com/Brendan-Black/black/blob/master/reference/magic-strings-check.md)'s terms map to
 Rust. Settings are in the [README](../../../README.md#magic-strings).
 
 - **Project:** a Cargo package's non-test code.

@@ -52,7 +52,7 @@ same however often it runs; that's what `check` compares against.
 
 `check` reports every string value that appears in two literals of a package's non-test code, and every place it
 appears, by the definition in the guide's
-[repeated-literal check](https://github.com/Brendan-Black/black/blob/master/conventions/values/magic-strings-check.md).
+[repeated-literal check](https://github.com/Brendan-Black/black/blob/master/reference/magic-strings-check.md).
 Name it, with a `const` or an enum, and the literal appears once. Each package is checked on its own.
 
 Only identical values match: `"orderId"` matches `"orderId"` and nothing else, not `"orderid"` or

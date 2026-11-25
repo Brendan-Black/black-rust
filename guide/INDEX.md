@@ -23,7 +23,8 @@ A rule with no file here applies as written.
 | [conventions/errors/messages-for-debuggers](conventions/errors/messages-for-debuggers.md) | `expect("why")`, not `unwrap()` |
 | [conventions/errors/messages-for-callers](conventions/errors/messages-for-callers.md) | `ErrorCode` enum |
 | [correctness/errors/nothing-half-done](correctness/errors/nothing-half-done.md) | write a temporary file, then `fs::rename` |
-| [correctness/testing/self-contained](correctness/testing/self-contained.md) | `Instant`, no `thread::sleep`, tests run in parallel, `set_var` |
+| [correctness/values/monotonic-time](correctness/values/monotonic-time.md) | `Instant`, not `SystemTime` |
+| [correctness/testing/self-contained](correctness/testing/self-contained.md) | no `thread::sleep`, tests run in parallel, `set_var` |
 | [conventions/testing/pseudos](conventions/testing/pseudos.md) | a pseudo behind a trait |
 
 ## Tools that hold the line
