@@ -29,7 +29,7 @@ not yours. `#[rustfmt::skip]` on an item is the only way to keep a layout by han
 ## `cargo black`
 
 ```sh
-cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.2.6   # or: --path ~/github/rust/black-rust
+cargo install --git https://github.com/Brendan-Black/black-rust --tag v0.3.0   # or: --path ~/github/rust/black-rust
 ```
 
 | Command | What it does |
