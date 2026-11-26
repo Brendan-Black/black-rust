@@ -6,6 +6,7 @@ A rule with no file here applies as written.
 
 | File | Adds |
 |---|---|
+| [philosophy/package-oriented](philosophy/package-oriented.md) | a repository per crate, referenced by git tag |
 | [conventions/design/seams](conventions/design/seams.md) | traits; generics vs `dyn` |
 | [conventions/design/least-interface](conventions/design/least-interface.md) | `&str`, `&[T]`, `impl AsRef<Path>`; the identity example |
 | [conventions/design/no-chained-interfaces](conventions/design/no-chained-interfaces.md) | supertraits |
