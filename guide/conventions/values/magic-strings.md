@@ -19,8 +19,9 @@ Rust. Settings are in the [README](../../../README.md#magic-strings).
 - **Project:** a Cargo package's non-test code.
 - **Argument:** includes a macro's arguments.
 - **Definition:** a `const` or `static`, or an enum constant's arguments.
-- **Wrapping:** `Some("hard")`, a variant, or a struct built from the literal.
-- **Proximity:** a function, a file, a module, or the whole crate, which reports nothing.
+- **Built from the literal:** `Some("hard")`, a variant, or a tuple struct.
+- **Proximity:** none (the default), a statement, a function, a file, a module, or the whole crate, which reports
+  nothing.
 - **Messages:** include `expect`'s message and a `debug_struct`'s field names.
 - **Not the project's:** `fs::read(..)` and `list.push(..)`, whatever the package names its own functions.
 - **Generated:** files under the build directory, or opening with a comment line that starts `@generated`

@@ -60,19 +60,15 @@ Only identical values match: `"orderId"` matches `"orderId"` and nothing else, n
 
 | A repeated value… | Is |
 |---|---|
-| passed as an argument at least once: `get("id")`, `.args(["--all"])`, `vec!["a"]`, `info!(target: "x", ...)` | an error |
-| passed as an argument once, every other use in other files or in that same function, and no constant among them | a warning: most likely another concept that shares the spelling, such as one flag in two commands' parsers |
-| a `const` or `static` whose whole value is the string, and a literal of it passed as an argument where that constant can be named (it is `pub`, or the literal is in its module or one inside it; a binary's constants are its own) | an error: the name exists, so use it |
-| only ever in one function, with at most one of its literals an argument (`strip_prefix("--x=")` beside a `"--x=" =>` arm) | not reported: read together, changed together. Two arguments in one function (declaring a flag and looking it up) are still an error |
-| all within `magic-strings-proximity` of each other, with no constant among them: in one statement, by default (`_ if arg.starts_with("--author") => value("--author")`) | not reported: read together, however many are arguments |
-| never an argument, in three or more functions: the same `==` or match arm written again (`"true" \| "yes" \| "on"` in four parsers) | a warning |
-| never an argument, in fewer: `let`, `return`, `==`, match arms | not reported, unless `magic-strings-elsewhere` asks |
+| passed as an argument at least once: `get("id")`, `.args(["--all"])`, `vec!["a"]`, `info!(target: "x", ...)` | an error, by `magic-strings` |
+| never an argument: `let`, `return`, `==`, match arms, and a literal in a constructor such as `Some("hard")` | an error, by `magic-strings-elsewhere` |
+| a literal beside a `const` or `static` it could use: one whose whole value is the string, and which is `pub`, or the literal is in its module or one inside it (a binary's constants are its own) | an error. Use the constant if it names the same concept; if it names another that shares the spelling, give the literal a name of its own |
+| a literal beside a constant it could not use | judged as if the constant weren't there |
 | only ever in `const`s and `static`s | not reported |
 
-Rust specifics: a literal is an argument when it is passed straight to a call, or inside `&`, `( )`, `[ ]`, a tuple
-or a constructor there (`Some(..)`, `Ok(..)`, a tuple struct or variant). A constructor's literal is otherwise
-elsewhere, so `Some("hard")` returned from a function is not an argument. Every literal in a macro call is an argument,
-except the message. A function is any `fn`, and a literal outside one belongs to the item it is in. Not counted:
+Rust specifics: a literal is an argument when it is passed straight to a call, or inside `&`, `( )`, `[ ]` or a tuple
+there. A literal a value is built from (`Some(..)`, `Ok(..)`, a tuple struct or variant) is elsewhere, whether or not
+that value is passed on. Every literal in a macro call is an argument, except the message. A function is any `fn`, and a literal outside one belongs to the item it is in. Not counted:
 messages (the format string of `format!`, `print!`/`println!`/`eprintln!`, `write!`, `panic!`, `assert!` and its kin,
 `anyhow!`/`bail!`/`ensure!` and the `log`/`tracing` macros, and what is formatted into it; the arguments of `expect`,
 `expect_err`, `context`, `wrap_err`, `ok_or`, `Err`, and any function of a type whose name ends in `Error`, such as
@@ -97,26 +93,28 @@ package that doesn't set its own, and a module's table sets them for part of a p
 ```toml
 [package.metadata.black]
 magic-strings = "warn"              # values passed as arguments: "deny" (default), "warn" or "allow"
-magic-strings-elsewhere = "warn"    # the most a value that is never an argument can be: "allow" (default), "warn" or "deny"
+magic-strings-elsewhere = "warn"    # the most a value that is never an argument can be: "deny" (default), "warn" or "allow"
 magic-strings-whitespace = true     # also check values with whitespace in them (default false)
-magic-strings-proximity = "file"    # how close a value's literals must be to be read together: "statement" (default), "function", "file", "module", "crate"
+magic-strings-proximity = "file"    # how close a value's literals may sit and go unreported: "none" (default), "statement", "function", "file", "module", "crate"
 
 [package.metadata.black.modules."cli"]  # the module cli and the modules inside it; "cli::log" for one of those
 magic-strings = "warn"
 magic-strings-proximity = "module"
 ```
 
-`magic-strings = "allow"` turns the check off for the package; `magic-strings-elsewhere = "warn"` or `"deny"` also
-reports values that are never an argument.
+`magic-strings = "allow"` turns the check off for the package; `magic-strings-elsewhere = "warn"` or `"allow"` lowers
+it for values that are never an argument.
 Values with whitespace in them (a space, a tab, a newline) are skipped unless `magic-strings-whitespace = true`: keys,
 headers and flags have none, so such a value is almost always text for people.
 
-`magic-strings-proximity` says how close a value's literals must all be to be read together, and so not reported,
-however many are arguments. A constant among them is never close: a constant plus a literal should use the constant.
+`magic-strings-proximity` loosens the check: a value whose literals all sit this close together isn't reported,
+however many are arguments. By default nothing is close, and a repeat is reported wherever it sits. A constant among
+them is never close: a constant plus a literal should use the constant.
 
 | Proximity | Literals are close when they are all in |
 |---|---|
-| `"statement"` (default) | one statement, or one branch's head and what it leads to: a match arm's pattern and guard with its expression or its block's first statement, an `if`'s condition with its block's first statement. Line breaks don't matter. An `if` or `match` inside another statement, such as a `let`, is part of that statement |
+| `"none"` (default) | never: every repeat is reported |
+| `"statement"` | one statement, or one branch's head and what it leads to: a match arm's pattern and guard with its expression or its block's first statement, an `if`'s condition with its block's first statement. Line breaks don't matter. An `if` or `match` inside another statement, such as a `let`, is part of that statement |
 | `"function"` | one function, or one item outside a function |
 | `"file"` | one file |
 | `"module"` | one module below the crate root and the modules inside it (`cli`, `cli::log`), or the root module's own files |

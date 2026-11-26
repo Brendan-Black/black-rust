@@ -210,7 +210,7 @@ fn settings_in(table: Option<&toml_edit::Item>, place: &str) -> Result<magic_str
 	if let Some(n) = table.get(PROXIMITY_SETTING).and_then(toml_edit::Item::as_integer) {
 		// 0.2.1 took a number of lines; that let the formatter decide what was close.
 		return Err(format!(
-			"{place}: {PROXIMITY_SETTING} is {n}, a number of lines; it is a word now: \"statement\" (the default), \"function\", \"file\", \"module\" or \"crate\""
+			"{place}: {PROXIMITY_SETTING} is {n}, a number of lines; it is a word now: \"none\" (the default), \"statement\", \"function\", \"file\", \"module\" or \"crate\""
 		));
 	}
 	Ok(Settings {

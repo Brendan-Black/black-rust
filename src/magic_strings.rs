@@ -5,17 +5,12 @@
 //! "orderId" and nothing else: not "orderid", not "orderIdList". Escapes are resolved first, so
 //! `"\x41"` and `"A"` are the same value, as are a raw and a plain literal with the same contents.
 //!
-//! Each literal is one of three kinds. An *argument* is passed straight to a function, method or macro (`get("id")`,
-//! `.args(["--all"])`): the biggest offenders, so a value with an argument among its literals gets the package's full
-//! level. A *definition* is inside a `const` or `static`: a value whose literals are all definitions is two names that
-//! happen to share a spelling, and isn't reported. Everything else (assignments, returns, comparisons, match arms) is
-//! *elsewhere*, and a value seen only there and in definitions is capped at the `magic-strings-elsewhere` level. A
-//! literal in a constructor (`Some("x")`, `Ok("x")`) is an argument only if the constructor is passed on.
-//!
-//! Two shapes are eased. A value whose literals are all in one function, with at most one of them an argument, isn't
-//! reported: a parser's `strip_prefix("--x=")` beside its `"--x=" =>` arm is read and changed together. And a value
-//! passed as an argument just once, with every other use in other files (or in that same function), is at most a
-//! warning: it is most likely another concept that shares the spelling, such as one flag in two commands' parsers.
+//! A value written twice is an error, wherever the two literals sit. Each literal is one of three kinds, which matter to
+//! the settings. An *argument* is passed straight to a function, method or macro (`get("id")`, `.args(["--all"])`): a
+//! value with an argument among its literals gets the package's `magic-strings` level. A *definition* is inside a
+//! `const` or `static`: a value whose literals are all definitions is two names that happen to share a spelling, and
+//! isn't reported. Everything else (assignments, returns, comparisons, match arms, and a literal in a constructor such
+//! as `Some("x")`) is *elsewhere*, and a value with no argument gets the `magic-strings-elsewhere` level.
 //!
 //! Not counted at all: values with no letter (`", "`, `"\n"`, `"404"`); values with whitespace in them, unless
 //! `magic-strings-whitespace` is true; messages (the format string of `format!`, `println!`, `panic!`, `write!`, the
@@ -47,14 +42,14 @@ pub enum Level {
 /// The level for values passed as arguments: `[package.metadata.black]`, `[workspace.metadata.black]` for every
 /// package that doesn't say, or a module's table (see [`MODULES_TABLE`]). Deny by default.
 pub const SETTING: &str = "magic-strings";
-/// The most severe a value that is never an argument can be, set the same way. Allow by default: only a value passed as
-/// an argument is reported unless a package opts in.
+/// The most severe a value that is never an argument can be, set the same way. Deny by default: a value written twice
+/// is an error whether or not it is passed on.
 pub const ELSEWHERE_SETTING: &str = "magic-strings-elsewhere";
 /// Whether values with whitespace in them are checked, set the same way: `true` or `false`. False by default: a key, a
 /// header or a flag has none, so a value with a space or a newline is almost always text for people.
 pub const WHITESPACE_SETTING: &str = "magic-strings-whitespace";
 /// How close a value's literals must all be to be read together, and so not reported, set the same way: one of the
-/// [`Proximity`] words. `"statement"` by default.
+/// [`Proximity`] words. `"none"` by default: a repeat is reported wherever it sits.
 pub const PROXIMITY_SETTING: &str = "magic-strings-proximity";
 /// The table, under `[package.metadata.black]`, of settings for part of the package, keyed by module path:
 /// `[package.metadata.black.modules."cli::log"]`. A module's table covers it and the modules inside it.
@@ -64,6 +59,8 @@ pub const MODULES_TABLE: &str = "modules";
 /// a constant plus a literal should use the constant.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Proximity {
+	/// Nothing is close: every repeat is reported.
+	None,
 	/// One statement, or one branch: a match arm with its guard, or an `if`'s condition with its block. Where the
 	/// formatter breaks the lines doesn't matter.
 	Statement,
@@ -77,7 +74,8 @@ pub enum Proximity {
 }
 
 /// Each proximity by the word a manifest uses for it.
-const PROXIMITIES: [(&str, Proximity); 5] = [
+const PROXIMITIES: [(&str, Proximity); 6] = [
+	("none", Proximity::None),
 	("statement", Proximity::Statement),
 	("function", Proximity::Function),
 	("file", Proximity::File),
@@ -97,6 +95,7 @@ impl Proximity {
 	fn holds(self, places: &[&Place]) -> bool {
 		let Some(first) = places.first() else { return false };
 		match self {
+			Self::None => false,
 			Self::Statement => places.iter().all(|p| p.unit == first.unit),
 			Self::Function => places.iter().all(|p| p.scope == first.scope),
 			Self::File => places.iter().all(|p| p.file == first.file),
@@ -181,9 +180,9 @@ impl Policy {
 		let level = settings.level.unwrap_or(Level::Deny);
 		Resolved {
 			level,
-			elsewhere: settings.elsewhere.unwrap_or(Level::Allow).min(level),
+			elsewhere: settings.elsewhere.unwrap_or(Level::Deny).min(level),
 			whitespace: settings.whitespace.unwrap_or(false),
-			proximity: settings.proximity.unwrap_or(Proximity::Statement),
+			proximity: settings.proximity.unwrap_or(Proximity::None),
 		}
 	}
 }
@@ -315,58 +314,32 @@ fn findings_in(package_dir: &Path, parsed: &[(PathBuf, syn::File)], policy: &Pol
 	seen.into_iter().filter_map(|(value, places)| finding(places).map(|f| (value, f))).collect()
 }
 
-/// What to report of a value's literals, if anything: not a value seen once, nor one whose literals are all definitions,
-/// nor one whose literals are all in one function (or other item) with at most one of them an argument, nor one whose
-/// literals are all close enough to be read together. A value across modules takes the most severe of their levels and
-/// the narrowest of their proximities.
+/// What to report of a value's literals, if anything: a value written twice, unless every literal is a definition, or
+/// the package has set a proximity and they are all within it. A value across modules takes the most severe of their
+/// levels and the narrowest of their proximities.
 fn finding(places: Vec<Place>) -> Option<Finding> {
-	// One function's literals are exempt only with at most one argument among them: two (declaring a flag and looking it
-	// up, or writing a key and reading it) are the typo the rule is for.
-	let arguments_in_all = places.iter().filter(|p| p.kind == Kind::Argument).count();
-	// A constant the literals could name is always the full level: a constant plus a literal should use the constant.
-	// One they couldn't (a private one of another module) says nothing about them, so it plays no part in what follows.
+	// A constant a literal could name counts as the value's other use, and is never close: the name exists, so the
+	// literal should use it. One no literal could name (a private one of another module) plays no part.
 	let defined = usable_constant(&places);
 	let literals: Vec<&Place> = places.iter().filter(|p| p.kind != Kind::Definition).collect();
-	let one_scope = literals.iter().all(|p| p.scope == literals[0].scope) && arguments_in_all <= 1;
-	let proximity = places.iter().map(|p| p.settings.proximity).min()?;
-	// Literals this close, however many are arguments, are read together: `starts_with("--x")` and `value("--x")` in one
-	// match arm.
-	let close = !defined && proximity.holds(&literals);
-	if places.len() < 2 || literals.is_empty() || (one_scope && !defined) || close {
+	if literals.is_empty() || (literals.len() < 2 && !defined) {
 		return None;
 	}
-	let mut arguments = places.iter().filter(|p| p.kind == Kind::Argument);
-	let first = arguments.next();
-	let lone_argument = match (first, arguments.next()) {
-		// Never with a constant the argument could name: the name exists, so the literal is wrong.
-		(Some(argument), None) if !usable_constant(&places) => places.iter().all(|p| p.scope == argument.scope || p.file != argument.file),
-		_ => false,
-	};
-	let as_argument = first.is_some();
-	let as_argument_level = places.iter().map(|p| p.settings.level).max()?;
-	let level = match (as_argument, lone_argument) {
-		// A lone argument, likely another concept sharing the spelling, is at most a warning.
-		(true, true) => as_argument_level.min(Level::Warn),
-		(true, false) => as_argument_level,
-		(false, _) => {
-			let elsewhere = places.iter().map(|p| p.settings.elsewhere).max()?;
-			// Compared or matched in several functions, a value is the same check written again each time (four parsers
-			// of "true" | "yes" | "on"): at least a warning, though it is never passed on.
-			let mut functions: Vec<usize> = places.iter().filter(|p| p.kind != Kind::Definition).map(|p| p.scope).collect();
-			functions.sort_unstable();
-			functions.dedup();
-			if functions.len() >= SPREAD { elsewhere.max(as_argument_level.min(Level::Warn)) } else { elsewhere }
-		}
-	};
+	let proximity = places.iter().map(|p| p.settings.proximity).min()?;
+	if !defined && proximity.holds(&literals) {
+		return None;
+	}
+	let as_argument = literals.iter().any(|p| p.kind == Kind::Argument);
+	let level = if as_argument { places.iter().map(|p| p.settings.level).max()? } else { places.iter().map(|p| p.settings.elsewhere).max()? };
 	(level != Level::Allow).then_some(Finding { places, level, as_argument })
 }
 
-/// Whether a constant among these literals can be named where one of them is passed as an argument: it is `pub`, or the
-/// argument is in its module or a module inside it. A private constant of another module is no name the literal could
-/// use, so it says nothing about whether the two are one concept.
+/// Whether a constant among these literals can be named where one of them is written: it is `pub`, or the literal is in
+/// its module or a module inside it. A private constant of another module is no name the literal could use, so it says
+/// nothing about whether the two are one concept.
 fn usable_constant(places: &[Place]) -> bool {
-	let arguments: Vec<&Place> = places.iter().filter(|p| p.kind == Kind::Argument).collect();
-	places.iter().filter(|d| d.kind == Kind::Definition).any(|d| arguments.iter().any(|a| can_name(d, a)))
+	let literals: Vec<&Place> = places.iter().filter(|p| p.kind != Kind::Definition).collect();
+	places.iter().filter(|d| d.kind == Kind::Definition).any(|d| literals.iter().any(|a| can_name(d, a)))
 }
 
 /// Whether code where `a` is can name the constant `d`. In one crate: when it is public, or `a` is in its module or one
@@ -393,9 +366,6 @@ fn is_binary_root(package_dir: &Path, file: &Path) -> bool {
 fn is_public(vis: &syn::Visibility) -> bool {
 	!matches!(vis, syn::Visibility::Inherited)
 }
-
-/// How many functions a value never passed as an argument must be in to be the same check written again.
-const SPREAD: usize = 3;
 
 /// Number sources, so each scope and unit gets its own number across the package.
 #[derive(Default)]
@@ -540,8 +510,8 @@ fn is_message_call(func: &syn::Expr) -> bool {
 }
 
 /// Whether a call builds a value rather than doing something with one: a tuple struct or enum variant, such as
-/// `Some(..)`, `Ok(..)` or `Mode::Named(..)`, by the capital its path ends with. A literal it wraps is passed on only
-/// if the value it builds is.
+/// `Some(..)`, `Ok(..)` or `Mode::Named(..)`, by the capital its path ends with. A literal it wraps is no argument,
+/// whether or not the value it builds is passed on.
 fn is_constructor(func: &syn::Expr) -> bool {
 	let syn::Expr::Path(p) = func else { return false };
 	p.path.segments.last().is_some_and(|s| s.ident.to_string().starts_with(char::is_uppercase))
@@ -652,8 +622,6 @@ impl Finder<'_> {
 			syn::Expr::Paren(p) => self.argument(&p.expr),
 			syn::Expr::Array(a) => a.elems.iter().for_each(|e| self.argument(e)),
 			syn::Expr::Tuple(t) => t.elems.iter().for_each(|e| self.argument(e)),
-			// `Some("x")` passed on is still passed on.
-			syn::Expr::Call(c) if is_constructor(&c.func) => c.args.iter().for_each(|e| self.argument(e)),
 			other => self.visit_expr(other),
 		}
 	}
@@ -738,7 +706,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 		if is_message_call(&call.func) {
 			return;
 		}
-		// A value wrapped (`Some("hard")`, `Ok("x")`, `Mode::Named("x")`) is only passed on if the wrapper is.
+		// A value wrapped (`Some("hard")`, `Ok("x")`, `Mode::Named("x")`) is built, not passed.
 		if is_constructor(&call.func) {
 			call.args.iter().for_each(|arg| self.visit_expr(arg));
 			return;
@@ -954,9 +922,21 @@ mod tests {
 	}
 
 	#[test]
-	fn literals_in_one_function_are_not() {
+	fn a_value_written_twice_in_one_function_is_reported() {
 		let found = check(&[("src/a.rs", "fn parse(a: &str) { if let Some(v) = a.strip_prefix(\"--abbrev=\") {} match a { \"--abbrev=\" => {}, _ => {} } }")]);
-		assert!(found.is_empty());
+		assert_eq!(found["--abbrev="].level, Level::Deny);
+	}
+
+	#[test]
+	fn a_value_never_passed_is_reported_too() {
+		let twice = [("src/a.rs", "fn a(v: &str) -> bool { v == \"yes\" }\nfn b(v: &str) -> bool { v == \"yes\" }")];
+		let found = check(&twice);
+		assert!(!found["yes"].as_argument && found["yes"].level == Level::Deny);
+		// The elsewhere level lowers it, or turns it off.
+		let warn = Settings { elsewhere: Some(Level::Warn), ..Settings::default() };
+		assert_eq!(check_with(&twice, warn, Vec::new())["yes"].level, Level::Warn);
+		let allow = Settings { elsewhere: Some(Level::Allow), ..Settings::default() };
+		assert!(check_with(&twice, allow, Vec::new()).is_empty());
 	}
 
 	#[test]
@@ -966,19 +946,22 @@ mod tests {
 	}
 
 	#[test]
-	fn one_statement_is_read_together_however_it_is_wrapped() {
+	fn the_statement_proximity_reads_one_statement_together_however_it_is_wrapped() {
+		let statement = |text: &str| check_with(&[("src/a.rs", text)], at(Proximity::Statement), Vec::new());
 		// A match arm and its guard, broken over lines the way rustfmt does.
 		let arm = "fn parse(arg: &str) { match arg {\n_ if arg.starts_with(\"--date\") =>\n{ value(\"--date\"); }\n_ => {} } }";
-		assert!(check(&[("src/a.rs", arm)]).is_empty());
+		assert!(statement(arm).is_empty());
+		// By default nothing is close: the same arm is reported.
+		assert!(check(&[("src/a.rs", arm)]).contains_key("--date"));
 		// An `if`'s condition and its block.
 		let branch = "fn parse(arg: &str) {\nif arg.starts_with(\"--author\") {\nvalue(\"--author\");\n}\n}";
-		assert!(check(&[("src/a.rs", branch)]).is_empty());
+		assert!(statement(branch).is_empty());
 		// Two statements are two.
 		let two = "fn run() {\nlet a = parse(&[(\"allow-http\", 0)]);\nlet b = a.has(\"allow-http\");\n}";
-		assert!(check(&[("src/a.rs", two)]).contains_key("allow-http"));
+		assert!(statement(two).contains_key("allow-http"));
 		// Two statements in one arm are two as well: declaring a flag, then looking it up.
 		let arm_of_two = "fn run(cmd: &str) { match cmd { \"log\" => {\nlet a = parse(&[(\"oldest\", 0)]);\nquery(!a.has(\"oldest\"));\n} _ => {} } }";
-		assert!(check(&[("src/a.rs", arm_of_two)]).contains_key("oldest"));
+		assert!(statement(arm_of_two).contains_key("oldest"));
 	}
 
 	#[test]
@@ -993,7 +976,7 @@ mod tests {
 		let two_modules = [("src/cli.rs", "fn put() { set(\"allow-ff\"); }"), ("src/odb.rs", "fn get() { read(\"allow-ff\"); }")];
 		assert!(check_with(&two_modules, at(Proximity::Module), Vec::new()).contains_key("allow-ff"));
 		assert!(check_with(&two_modules, at(Proximity::Crate), Vec::new()).is_empty());
-		assert!(Proximity::parse("line").is_err() && Proximity::parse("module").is_ok());
+		assert!(Proximity::parse("line").is_err() && Proximity::parse("module").is_ok() && Proximity::parse("none").is_ok());
 	}
 
 	#[test]
@@ -1037,16 +1020,12 @@ mod tests {
 	}
 
 	#[test]
-	fn a_wrapped_value_returned_is_not_an_argument() {
-		let found = check_with(
-			&[("src/a.rs", "fn name() -> Option<&'static str> { Some(\"hard\") }\nfn is(a: &str) -> bool { a == \"hard\" }")],
-			Settings { elsewhere: Some(Level::Warn), ..Settings::default() },
-			Vec::new(),
-		);
+	fn a_wrapped_value_is_not_an_argument() {
+		let found = check(&[("src/a.rs", "fn name() -> Option<&'static str> { Some(\"hard\") }\nfn is(a: &str) -> bool { a == \"hard\" }")]);
 		assert!(!found["hard"].as_argument);
-		// Passed on, it still is.
-		let found = check(&[("src/a.rs", "fn one() { f(Some(\"hard\")); }\nfn two() { g(\"hard\"); }")]);
-		assert!(found["hard"].as_argument);
+		// Nor when the value it builds is passed on.
+		let found = check(&[("src/a.rs", "fn one() { f(Some(\"hard\")); }\nfn two() { g(Some(\"hard\")); }")]);
+		assert!(!found["hard"].as_argument && found["hard"].level == Level::Deny);
 	}
 
 	#[test]
@@ -1072,15 +1051,9 @@ mod tests {
 	}
 
 	#[test]
-	fn a_lone_argument_among_other_files_uses_is_a_warning() {
-		let found = check(&[
-			("src/a.rs", "fn quiet(a: &str) { f(\"-q\"); match a { \"-q\" => {}, _ => {} } }"),
-			("src/b.rs", "fn parse(a: &str) { match a { \"-q\" => {}, _ => {} } }"),
-		]);
-		assert_eq!(found["-q"].level, Level::Warn);
-		// Another use in the argument's own file, outside its function, is the same concept as far as anyone can tell.
-		let found = check(&[("src/a.rs", "fn one() { f(\"-q\"); }\nfn two(a: &str) { match a { \"-q\" => {}, _ => {} } }")]);
-		assert_eq!(found["-q"].level, Level::Deny);
+	fn one_argument_with_its_other_uses_in_other_files_is_an_error() {
+		let found = check(&[("src/a.rs", "fn quiet() { f(\"-q\"); }"), ("src/b.rs", "fn parse(a: &str) { match a { \"-q\" => {}, _ => {} } }")]);
+		assert!(found["-q"].as_argument && found["-q"].level == Level::Deny);
 	}
 
 	#[test]
@@ -1117,18 +1090,12 @@ mod tests {
 		assert_eq!(module("pkg/src/bin/tool.rs"), "");
 	}
 	#[test]
-	fn the_same_comparison_in_three_functions_is_a_warning() {
-		let parsers = "fn a(v: &str) -> bool { matches!(v, \"yes\" | \"on\") }\nfn b(v: &str) -> bool { v == \"yes\" }\nfn c(v: &str) -> bool { match v { \"yes\" => true, _ => false } }";
-		assert_eq!(check(&[("src/a.rs", parsers)])["yes"].level, Level::Warn);
-		// In two functions it is still nobody's business but theirs.
-		assert!(!check(&[("src/a.rs", "fn a(v: &str) -> bool { v == \"yes\" }\nfn b(v: &str) -> bool { v == \"yes\" }")]).contains_key("yes"));
-	}
-
-	#[test]
-	fn a_literal_beside_a_constant_keeps_the_full_level() {
-		// One argument, its only other use in another file: a warning, but not when that use is the constant.
+	fn a_literal_beside_a_constant_it_could_use_is_reported() {
 		let files = [("src/refs.rs", "pub const HEAD: &str = \"HEAD\";"), ("src/log.rs", "fn a() { resolve(\"HEAD\"); }")];
 		assert_eq!(check(&files)["HEAD"].level, Level::Deny);
+		// Passed on or not.
+		let compared = [("src/refs.rs", "pub const HEAD: &str = \"HEAD\";"), ("src/log.rs", "fn a(r: &str) -> bool { r == \"HEAD\" }")];
+		assert_eq!(check(&compared)["HEAD"].level, Level::Deny);
 		// A private constant of another module is no name the literal could use: the literal is used once.
 		let private = [("src/speech.rs", "const ESPEAK_WAV: &str = \"-w\";"), ("src/awake.rs", "fn a() { run(\"-w\"); }")];
 		assert!(!check(&private).contains_key("-w"), "caffeinate's -w is used once");
@@ -1165,7 +1132,7 @@ mod tests {
 	#[test]
 	fn a_branch_inside_another_statement_is_part_of_it() {
 		let let_if = "fn a(get: fn(&str) -> &str) {\nlet name = if get(\"Name\").is_empty() {\n\"(unnamed)\"\n} else {\nget(\"Name\")\n};\n}";
-		assert!(check(&[("src/a.rs", let_if)]).is_empty());
+		assert!(check_with(&[("src/a.rs", let_if)], at(Proximity::Statement), Vec::new()).is_empty());
 	}
 	#[test]
 	fn an_entry_in_a_table_is_no_name_for_the_string() {
